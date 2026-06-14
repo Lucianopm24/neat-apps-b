@@ -493,7 +493,9 @@ app.post("/chat/messages/:chatId", auth, async (req, res) => {
       { $set: { updatedAt: new Date(), lastMessage: content || `[${type}]` } }
     );
 
-    res.status(201).json({ _id: result.insertedId, ...message });
+    const savedMessage = { _id: result.insertedId, ...message };
+notifyParticipants(database, req.params.chatId, savedMessage, identifier);
+res.status(201).json(savedMessage);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Error interno" });
