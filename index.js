@@ -173,6 +173,22 @@ app.post("/chat/telegram/upload", auth, upload.single("file"), async (req, res) 
   }
 });
 
+// Actualizar perfil (bio + foto de perfil vía Telegram file_id)
+app.put("/chat/me", auth, async (req, res) => {
+  try {
+    const { bio, avatarFileId } = req.body;
+    if (req.user.role === "admin") return res.status(400).json({ error: "Admin no tiene perfil editable" });
+    const database = await getDb();
+    await database.collection("users").updateOne(
+      { _id: new ObjectId(req.user.userId) },
+      { $set: { bio: bio ?? undefined, avatarFileId: avatarFileId ?? undefined } }
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
 app.post("/chat/login", async (req, res) => {
   try {
     const { username, password } = req.body;
