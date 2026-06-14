@@ -3,6 +3,8 @@ const jwt = require("jsonwebtoken");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const { MongoClient, ObjectId } = require("mongodb");
+// ── Agregar al inicio del archivo junto a las otras constantes ─────────────────
+const webpush = require("web-push");
 
 const app = express();
 app.use(express.json());
@@ -112,6 +114,103 @@ app.post("/chat/register", async (req, res) => {
     res.status(500).json({ error: "Error interno" });
   }
 });
+
+
+webpush.setVapidDetails(
+  process.env.VAPID_EMAIL,
+  process.env.VAPID_PUBLIC_KEY,
+  process.env.VAPID_PRIVATE_KEY
+);
+
+// ── Función interna — llamar desde POST /chat/messages/:chatId ─────────────────
+// Reemplaza el res.status(201).json(...) final del endpoint de mensajes con esto:
+async function notifyParticipants(database, chatId, message, senderIdentifier) {
+  const chat = await database.collection("chats").findOne({ _id: new ObjectId(chatId) });
+  if (!chat) return;
+
+  const recipients = chat.participants.filter(p => p !== senderIdentifier);
+  if (!recipients.length) return;
+
+  const subscriptions = await database.collection("push_subscriptions")
+    .find({ userId: { $in: recipients } })
+    .toArray();
+
+  const payload = JSON.stringify({
+    title: `${message.senderUsername} en ${chat.name || "chat"}`,
+    body: message.type === "text" ? message.content : `[${message.type}]`,
+    chatId: chatId,
+    url: `/chat/${chatId}`,
+  });
+
+  await Promise.allSettled(
+    subscriptions.map(sub =>
+      webpush.sendNotification(sub.subscription, payload).catch(async err => {
+        if (err.statusCode === 410) {
+          await database.collection("push_subscriptions").deleteOne({ _id: sub._id });
+        }
+      })
+    )
+  );
+}
+
+// ── Guardar suscripción push del browser ───────────────────────────────────────
+app.post("/chat/push/subscribe", auth, async (req, res) => {
+  try {
+    const { subscription } = req.body;
+    if (!subscription?.endpoint) return res.status(400).json({ error: "Suscripción inválida" });
+
+    const identifier = req.user.userId || req.user.username;
+    const database = await getDb();
+
+    await database.collection("push_subscriptions").updateOne(
+      { "subscription.endpoint": subscription.endpoint },
+      {
+        $set: {
+          userId: identifier,
+          username: req.user.username,
+          subscription,
+          updatedAt: new Date(),
+        },
+        $setOnInsert: { createdAt: new Date() },
+      },
+      { upsert: true }
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── Eliminar suscripción push ──────────────────────────────────────────────────
+app.delete("/chat/push/subscribe", auth, async (req, res) => {
+  try {
+    const { endpoint } = req.body;
+    if (!endpoint) return res.status(400).json({ error: "endpoint requerido" });
+
+    const database = await getDb();
+    await database.collection("push_subscriptions").deleteOne({
+      "subscription.endpoint": endpoint,
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── Devolver la VAPID public key al frontend ───────────────────────────────────
+app.get("/chat/push/vapid-public-key", (req, res) => {
+  res.json({ key: process.env.VAPID_PUBLIC_KEY });
+});
+
+// ── Así queda el POST /chat/messages/:chatId modificado ───────────────────────
+// Agrega esto ANTES del res.status(201).json(...) final del endpoint de mensajes:
+//
+//   const savedMessage = { _id: result.insertedId, ...message };
+//   notifyParticipants(database, req.params.chatId, savedMessage, identifier);
+//   res.status(201).json(savedMessage);
 
 // ── Telegram upload ────────────────────────────────────────────────────────────
 const multer = require("multer");
