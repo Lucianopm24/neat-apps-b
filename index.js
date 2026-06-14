@@ -113,6 +113,66 @@ app.post("/chat/register", async (req, res) => {
   }
 });
 
+// ── Telegram upload ────────────────────────────────────────────────────────────
+const multer = require("multer");
+const FormData = require("form-data");
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
+
+app.post("/chat/telegram/upload", auth, upload.single("file"), async (req, res) => {
+  try {
+    if (!TELEGRAM_BOT_TOKEN)
+      return res.status(503).json({ error: "TELEGRAM_BOT_TOKEN no configurado" });
+    if (!req.file)
+      return res.status(400).json({ error: "Archivo requerido" });
+
+    const STORAGE_CHAT_ID = process.env.TELEGRAM_STORAGE_CHAT_ID;
+    if (!STORAGE_CHAT_ID)
+      return res.status(503).json({ error: "TELEGRAM_STORAGE_CHAT_ID no configurado" });
+
+    // Elegir método según mimetype
+    const mime = req.file.mimetype;
+    let method = "sendDocument";
+    if (mime.startsWith("image/")) method = "sendPhoto";
+    else if (mime.startsWith("video/")) method = "sendVideo";
+    else if (mime.startsWith("audio/")) method = "sendAudio";
+    else if (mime === "audio/ogg" || mime.includes("opus")) method = "sendVoice";
+
+    const form = new FormData();
+    form.append("chat_id", STORAGE_CHAT_ID);
+    const fieldName = method.replace("send", "").toLowerCase();
+    form.append(fieldName, req.file.buffer, {
+      filename: req.file.originalname,
+      contentType: req.file.mimetype,
+    });
+
+    const tgRes = await fetch(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`,
+      { method: "POST", body: form }
+    );
+    const tgData = await tgRes.json();
+
+    if (!tgData.ok)
+      return res.status(500).json({ error: "Error subiendo a Telegram", detail: tgData.description });
+
+    // Extraer file_id del mensaje devuelto
+    const msg = tgData.result;
+    const fileObj = msg.photo
+      ? msg.photo[msg.photo.length - 1]  // foto: array, tomar la de mayor resolución
+      : msg[fieldName];
+
+    res.json({
+      telegramFileId: fileObj.file_id,
+      type: fieldName,
+      mimeType: req.file.mimetype,
+      originalName: req.file.originalname,
+      fileSize: fileObj.file_size || req.file.size,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
 app.post("/chat/login", async (req, res) => {
   try {
     const { username, password } = req.body;
