@@ -403,9 +403,9 @@ app.put("/chat/users/:id/role", adminAuth, async (req, res) => {
 // Listar chats del usuario autenticado
 app.get("/chat/chats", auth, async (req, res) => {
   const database = await getDb();
-  const identifier = req.user.userId || req.user.username;
-  const chats = await database.collection("chats")
-    .find({ participants: identifier })
+  const identifier = req.user.username;
+const chats = await database.collection("chats")
+  .find({ participants: identifier })
     .sort({ updatedAt: -1 })
     .toArray();
   res.json(chats);
@@ -415,10 +415,17 @@ app.get("/chat/chats", auth, async (req, res) => {
 app.post("/chat/chats", auth, async (req, res) => {
   try {
     const { name, type = "direct", participants = [] } = req.body;
-    const identifier = req.user.userId || req.user.username;
+const identifier = req.user.username; // siempre username, nunca ID
 
-    // Asegurar que el creador esté en participantes
-    const allParticipants = [...new Set([identifier, ...participants])];
+// Resolver usernames de los participantes
+const database = await getDb();
+const resolvedParticipants = await Promise.all(participants.map(async (p) => {
+  if (!p.match(/^[0-9a-f]{24}$/i)) return p; // ya es username
+  const user = await database.collection("users").findOne({ _id: new ObjectId(p) });
+  return user ? user.username : p;
+}));
+
+const allParticipants = [...new Set([identifier, ...resolvedParticipants])];
 
     const database = await getDb();
     const result = await database.collection("chats").insertOne({
