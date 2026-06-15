@@ -244,10 +244,33 @@ app.post("/chat/telegram/upload", auth, upload.single("file"), async (req, res) 
       contentType: req.file.mimetype,
     });
 
-    const tgRes = await fetch(
-  `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`,
-  { method: "POST", body: form, headers: form.getHeaders() }
-);
+    const https = require("https");
+    const formBuffer = form.getBuffer();
+    const formHeaders = form.getHeaders();
+
+    const tgResponse = await new Promise((resolve, reject) => {
+      const options = {
+        hostname: "api.telegram.org",
+        path: `/bot${TELEGRAM_BOT_TOKEN}/${method}`,
+        method: "POST",
+        headers: { ...formHeaders, "Content-Length": formBuffer.length },
+      };
+      const reqTg = https.request(options, (resTg) => {
+        let data = "";
+        resTg.on("data", chunk => data += chunk);
+        resTg.on("end", () => resolve(data));
+      });
+      reqTg.on("error", reject);
+      reqTg.write(formBuffer);
+      reqTg.end();
+    });
+
+    let tgData;
+    try {
+      tgData = JSON.parse(tgResponse);
+    } catch {
+      return res.status(500).json({ error: "Telegram respuesta inválida", raw: tgResponse });
+    }
     const rawText = await tgRes.text();
 let tgData;
 try {
