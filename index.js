@@ -271,7 +271,6 @@ app.post("/chat/telegram/upload", auth, upload.single("file"), async (req, res) 
     } catch {
       return res.status(500).json({ error: "Telegram respuesta inválida", raw: tgResponse });
     }
-    const rawText = await tgRes.text();
 
     if (!tgData.ok)
       return res.status(500).json({ error: "Error subiendo a Telegram", detail: tgData.description });
