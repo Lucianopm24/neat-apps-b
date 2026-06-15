@@ -248,7 +248,13 @@ app.post("/chat/telegram/upload", auth, upload.single("file"), async (req, res) 
   `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`,
   { method: "POST", body: form, headers: form.getHeaders() }
 );
-    const tgData = await tgRes.json();
+    const rawText = await tgRes.text();
+let tgData;
+try {
+  tgData = JSON.parse(rawText);
+} catch {
+  return res.status(500).json({ error: "Telegram devolvió respuesta inválida", raw: rawText });
+}
 
     if (!tgData.ok)
       return res.status(500).json({ error: "Error subiendo a Telegram", detail: tgData.description });
