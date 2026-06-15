@@ -245,9 +245,9 @@ app.post("/chat/telegram/upload", auth, upload.single("file"), async (req, res) 
     });
 
     const tgRes = await fetch(
-      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`,
-      { method: "POST", body: form }
-    );
+  `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`,
+  { method: "POST", body: form, headers: form.getHeaders() }
+);
     const tgData = await tgRes.json();
 
     if (!tgData.ok)
