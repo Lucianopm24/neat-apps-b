@@ -426,8 +426,7 @@ const resolvedParticipants = await Promise.all(participants.map(async (p) => {
 }));
 
 const allParticipants = [...new Set([identifier, ...resolvedParticipants])];
-
-    const database = await getDb();
+    
     const result = await database.collection("chats").insertOne({
       name: name || null,
       type,
