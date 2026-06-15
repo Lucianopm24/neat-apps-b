@@ -573,6 +573,216 @@ app.get("/chat/telegram/file/:fileId", auth, async (req, res) => {
   }
 });
 
+// ── Watch — Videos ────────────────────────────────────────────────────────────
+
+app.post("/watch/videos", auth, async (req, res) => {
+  try {
+    const { title, description, fileId, thumbnailFileId, duration, category } = req.body;
+    if (!title || !fileId) return res.status(400).json({ error: "title y fileId requeridos" });
+
+    const identifier = req.user.userId || req.user.username;
+    const database = await getDb();
+    const result = await database.collection("watch_videos").insertOne({
+      title, description, fileId, thumbnailFileId: thumbnailFileId || null,
+      duration: duration || null, category: category || null,
+      uploadedBy: identifier, uploaderUsername: req.user.username,
+      likes: [], views: 0, createdAt: new Date()
+    });
+    res.status(201).json({ _id: result.insertedId, title, fileId });
+  } catch (err) {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+app.get("/watch/videos", async (req, res) => {
+  try {
+    const database = await getDb();
+    const { category, uploader, quick, limit = 20, before } = req.query;
+    const filter = {};
+    if (category) filter.category = category;
+    if (uploader) filter.uploaderUsername = uploader;
+    if (quick === "true") filter.duration = { $lte: 120 };
+    if (quick === "false") filter.duration = { $gt: 120 };
+    if (before) filter.createdAt = { $lt: new Date(before) };
+
+    const videos = await database.collection("watch_videos")
+      .find(filter).sort({ createdAt: -1 }).limit(parseInt(limit)).toArray();
+    res.json(videos);
+  } catch (err) {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+app.get("/watch/videos/:id", async (req, res) => {
+  try {
+    const database = await getDb();
+    const video = await database.collection("watch_videos")
+      .findOne({ _id: new ObjectId(req.params.id) });
+    if (!video) return res.status(404).json({ error: "Video no encontrado" });
+
+    // Sumar vista
+    await database.collection("watch_videos").updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $inc: { views: 1 } }
+    );
+    res.json(video);
+  } catch {
+    res.status(400).json({ error: "ID inválido" });
+  }
+});
+
+app.put("/watch/videos/:id", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const video = await database.collection("watch_videos")
+      .findOne({ _id: new ObjectId(req.params.id) });
+    if (!video) return res.status(404).json({ error: "No encontrado" });
+
+    const identifier = req.user.userId || req.user.username;
+    if (video.uploadedBy !== identifier && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+
+    const { title, description, thumbnailFileId, category } = req.body;
+    await database.collection("watch_videos").updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { title, description, thumbnailFileId, category } }
+    );
+    res.json({ ok: true });
+  } catch {
+    res.status(400).json({ error: "ID inválido" });
+  }
+});
+
+app.delete("/watch/videos/:id", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const video = await database.collection("watch_videos")
+      .findOne({ _id: new ObjectId(req.params.id) });
+    if (!video) return res.status(404).json({ error: "No encontrado" });
+
+    const identifier = req.user.userId || req.user.username;
+    if (video.uploadedBy !== identifier && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+
+    await database.collection("watch_videos").deleteOne({ _id: new ObjectId(req.params.id) });
+    await database.collection("watch_comments").deleteMany({ videoId: req.params.id });
+    res.json({ ok: true });
+  } catch {
+    res.status(400).json({ error: "ID inválido" });
+  }
+});
+
+// ── Watch — Likes ─────────────────────────────────────────────────────────────
+
+app.post("/watch/videos/:id/like", auth, async (req, res) => {
+  try {
+    const identifier = req.user.userId || req.user.username;
+    const database = await getDb();
+    const video = await database.collection("watch_videos")
+      .findOne({ _id: new ObjectId(req.params.id) });
+    if (!video) return res.status(404).json({ error: "No encontrado" });
+
+    const liked = video.likes.includes(identifier);
+    await database.collection("watch_videos").updateOne(
+      { _id: new ObjectId(req.params.id) },
+      liked ? { $pull: { likes: identifier } } : { $push: { likes: identifier } }
+    );
+    res.json({ liked: !liked, total: video.likes.length + (liked ? -1 : 1) });
+  } catch {
+    res.status(400).json({ error: "ID inválido" });
+  }
+});
+
+// ── Watch — Comentarios ───────────────────────────────────────────────────────
+
+app.post("/watch/videos/:id/comments", auth, async (req, res) => {
+  try {
+    const { content } = req.body;
+    if (!content) return res.status(400).json({ error: "content requerido" });
+
+    const identifier = req.user.userId || req.user.username;
+    const database = await getDb();
+    const result = await database.collection("watch_comments").insertOne({
+      videoId: req.params.id,
+      authorId: identifier,
+      authorUsername: req.user.username,
+      content,
+      createdAt: new Date()
+    });
+    res.status(201).json({ _id: result.insertedId, content, authorUsername: req.user.username });
+  } catch (err) {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+app.get("/watch/videos/:id/comments", async (req, res) => {
+  try {
+    const database = await getDb();
+    const comments = await database.collection("watch_comments")
+      .find({ videoId: req.params.id }).sort({ createdAt: 1 }).toArray();
+    res.json(comments);
+  } catch {
+    res.status(400).json({ error: "Error" });
+  }
+});
+
+app.delete("/watch/comments/:id", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const comment = await database.collection("watch_comments")
+      .findOne({ _id: new ObjectId(req.params.id) });
+    if (!comment) return res.status(404).json({ error: "No encontrado" });
+
+    const identifier = req.user.userId || req.user.username;
+    if (comment.authorId !== identifier && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+
+    await database.collection("watch_comments").deleteOne({ _id: new ObjectId(req.params.id) });
+    res.json({ ok: true });
+  } catch {
+    res.status(400).json({ error: "ID inválido" });
+  }
+});
+
+// ── Watch — Canales / Suscripciones ──────────────────────────────────────────
+
+app.post("/watch/channels/:userId/subscribe", auth, async (req, res) => {
+  try {
+    const identifier = req.user.userId || req.user.username;
+    if (identifier === req.params.userId)
+      return res.status(400).json({ error: "No puedes suscribirte a ti mismo" });
+
+    const database = await getDb();
+    const existing = await database.collection("watch_subscriptions")
+      .findOne({ subscriberId: identifier, channelId: req.params.userId });
+
+    if (existing) {
+      await database.collection("watch_subscriptions").deleteOne({ _id: existing._id });
+      return res.json({ subscribed: false });
+    }
+
+    await database.collection("watch_subscriptions").insertOne({
+      subscriberId: identifier, channelId: req.params.userId, createdAt: new Date()
+    });
+    res.json({ subscribed: true });
+  } catch (err) {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+app.get("/watch/channels/:userId", async (req, res) => {
+  try {
+    const database = await getDb();
+    const videos = await database.collection("watch_videos")
+      .find({ uploadedBy: req.params.userId }).sort({ createdAt: -1 }).toArray();
+    const subscriberCount = await database.collection("watch_subscriptions")
+      .countDocuments({ channelId: req.params.userId });
+    res.json({ userId: req.params.userId, videos, subscriberCount });
+  } catch (err) {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
 // ── Apps (público — sin cambios para Neat Astore) ─────────────────────────────
 app.get("/apps", async (req, res) => {
   const database = await getDb();
