@@ -294,6 +294,17 @@ app.post("/chat/telegram/upload", auth, upload.single("file"), async (req, res) 
   }
 });
 
+app.get("/chat/users/list", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const users = await database.collection("users")
+      .find({}, { projection: { passwordHash: 0 } })
+      .toArray();
+    const adminUser = { _id: "admin", username: ADMIN_USER, email: `${ADMIN_USER}@${EMAIL_DOMAIN}`, role: "admin" };
+    res.json([adminUser, ...users]);
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
 // Actualizar perfil (bio + foto de perfil vía Telegram file_id)
 app.put("/chat/me", auth, async (req, res) => {
   try {
