@@ -1291,6 +1291,356 @@ app.get("/forums/posts/:id/upvoters", auth, async (req, res) => {
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
 
+// ── Neat ID ───────────────────────────────────────────────────────────────────
+
+app.get("/u/:username", async (req, res) => {
+  try {
+    const database = await getDb();
+    const isAdmin = req.params.username.toLowerCase() === ADMIN_USER.toLowerCase();
+    
+    let profile;
+    if (isAdmin) {
+      profile = {
+        username: ADMIN_USER,
+        email: `${ADMIN_USER}@${EMAIL_DOMAIN}`,
+        role: "admin",
+        verified: true,
+        bio: null,
+        avatarFileId: null,
+        customLinks: [],
+        neatPlus: true
+      };
+    } else {
+      const user = await database.collection("users")
+        .findOne({ username: { $regex: new RegExp(`^${req.params.username}$`, "i") } },
+          { projection: { passwordHash: 0 } });
+      if (!user) return res.status(404).json({ error: "Usuario no encontrado" });
+      profile = user;
+    }
+
+    // Links automáticos — siempre presentes
+    const autoLinks = [
+      { label: "Neat Chatter", url: `https://neat.qzz.io/byneat/chatter`, icon: "💬", auto: true },
+      { label: "Neat Watch", url: `https://neat.qzz.io/byneat/watch`, icon: "▶️", auto: true },
+      { label: "Neat Forums", url: `https://neat.qzz.io/byneat/forums`, icon: "🗣️", auto: true },
+      { label: "Neat Points", url: `https://neat.qzz.io/byneat/points`, icon: "💰", auto: true },
+    ];
+
+    res.json({
+      username: profile.username,
+      email: profile.email,
+      role: profile.role,
+      verified: !!profile.verified,
+      bio: profile.bio || null,
+      avatarFileId: profile.avatarFileId || null,
+      neatPlus: !!profile.neatPlus,
+      customLinks: profile.customLinks || [],
+      customCategories: profile.customCategories || [],
+      autoLinks,
+      hasCustomWeb: !!profile.customWeb
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// Actualizar perfil de Neat ID
+app.put("/u/:username", auth, async (req, res) => {
+  try {
+    if (req.user.username.toLowerCase() !== req.params.username.toLowerCase() && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+    if (req.user.role === "admin")
+      return res.status(400).json({ error: "Admin no tiene perfil editable aquí" });
+
+    const { bio, customLinks, customCategories } = req.body;
+    const database = await getDb();
+    const user = await database.collection("users").findOne({ username: req.user.username });
+
+    const update = {};
+    if (bio !== undefined) update.bio = bio;
+    
+    if (customLinks !== undefined) {
+      // Sin Plus: máximo 10 links sin categorías
+      const hasPlus = !!user?.neatPlus;
+      const links = customLinks.slice(0, hasPlus ? 1000 : 10).map(l => ({
+        label: String(l.label || "").slice(0, 50),
+        url: String(l.url || ""),
+        icon: String(l.icon || "🔗").slice(0, 10),
+        category: hasPlus ? (l.category || null) : null
+      }));
+      update.customLinks = links;
+    }
+
+    if (customCategories !== undefined) {
+      const hasPlus = !!user?.neatPlus;
+      if (!hasPlus) return res.status(403).json({ error: "Necesitas Neat Plus para categorías" });
+      update.customCategories = customCategories.slice(0, 20).map(c => String(c).slice(0, 30));
+    }
+
+    await database.collection("users").updateOne(
+      { username: req.user.username },
+      { $set: update }
+    );
+    res.json({ ok: true });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Custom web (solo Plus)
+app.get("/u/:username/web", async (req, res) => {
+  try {
+    const database = await getDb();
+    const user = await database.collection("users")
+      .findOne({ username: { $regex: new RegExp(`^${req.params.username}$`, "i") } },
+        { projection: { customWeb: 1, neatPlus: 1 } });
+    if (!user) return res.status(404).json({ error: "Usuario no encontrado" });
+    if (!user.neatPlus) return res.status(403).json({ error: "Necesitas Neat Plus" });
+    if (!user.customWeb) return res.status(404).json({ error: "Sin página personalizada" });
+    // Devolver el HTML directamente
+    res.setHeader("Content-Type", "text/html");
+    res.send(user.customWeb);
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+app.put("/u/:username/web", auth, async (req, res) => {
+  try {
+    if (req.user.username.toLowerCase() !== req.params.username.toLowerCase() && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+
+    const database = await getDb();
+    const user = await database.collection("users").findOne({ username: req.user.username });
+    if (!user?.neatPlus && req.user.role !== "admin")
+      return res.status(403).json({ error: "Necesitas Neat Plus" });
+
+    const { html } = req.body;
+    if (!html) return res.status(400).json({ error: "html requerido" });
+    if (html.length > 500000) return res.status(400).json({ error: "HTML demasiado grande (max 500KB)" });
+
+    await database.collection("users").updateOne(
+      { username: req.user.username },
+      { $set: { customWeb: html } }
+    );
+    res.json({ ok: true });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// ── OAuth2 ────────────────────────────────────────────────────────────────────
+
+const crypto = require("crypto");
+
+// Registrar cliente OAuth (solo admin)
+app.post("/oauth/clients", adminAuth, async (req, res) => {
+  try {
+    const { name, redirectUris, scopes } = req.body;
+    if (!name || !redirectUris?.length) return res.status(400).json({ error: "name y redirectUris requeridos" });
+
+    const database = await getDb();
+    const client = {
+      name,
+      clientId: crypto.randomBytes(16).toString("hex"),
+      clientSecret: crypto.randomBytes(32).toString("hex"),
+      redirectUris,
+      scopes: scopes || ["profile"],
+      createdAt: new Date()
+    };
+    await database.collection("oauth_clients").insertOne(client);
+    res.json(client);
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Listar clientes OAuth (solo admin)
+app.get("/oauth/clients", adminAuth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const clients = await database.collection("oauth_clients")
+      .find({}, { projection: { clientSecret: 0 } }).toArray();
+    res.json(clients);
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Info del cliente OAuth (público — para mostrar en la pantalla de autorización)
+app.get("/oauth/clients/:clientId", async (req, res) => {
+  try {
+    const database = await getDb();
+    const client = await database.collection("oauth_clients")
+      .findOne({ clientId: req.params.clientId }, { projection: { clientSecret: 0 } });
+    if (!client) return res.status(404).json({ error: "Cliente no encontrado" });
+    res.json(client);
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Autorizar — el usuario aprueba, se genera el code
+app.post("/oauth/authorize", auth, async (req, res) => {
+  try {
+    const { clientId, redirectUri, scopes } = req.body;
+    const database = await getDb();
+
+    const client = await database.collection("oauth_clients").findOne({ clientId });
+    if (!client) return res.status(404).json({ error: "Cliente no encontrado" });
+    if (!client.redirectUris.includes(redirectUri))
+      return res.status(400).json({ error: "redirect_uri no autorizada" });
+
+    // Validar scopes pedidos
+    const validScopes = ["profile", "email", "points", "chatter", "watch", "forums", "account"];
+    const requestedScopes = (scopes || ["profile"]).filter(s => validScopes.includes(s));
+
+    const code = crypto.randomBytes(32).toString("hex");
+    await database.collection("oauth_codes").insertOne({
+      code,
+      clientId,
+      username: req.user.username,
+      redirectUri,
+      scopes: requestedScopes,
+      expiresAt: new Date(Date.now() + 5 * 60 * 1000), // 5 minutos
+      used: false
+    });
+
+    res.json({ code, redirectUri });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Token exchange — code → token
+app.post("/oauth/token", async (req, res) => {
+  try {
+    const { code, clientId, clientSecret, redirectUri } = req.body;
+    if (!code || !clientId || !clientSecret)
+      return res.status(400).json({ error: "Faltan campos" });
+
+    const database = await getDb();
+
+    const client = await database.collection("oauth_clients").findOne({ clientId, clientSecret });
+    if (!client) return res.status(401).json({ error: "Credenciales de cliente inválidas" });
+
+    const oauthCode = await database.collection("oauth_codes").findOne({ code, clientId });
+    if (!oauthCode) return res.status(400).json({ error: "Código inválido" });
+    if (oauthCode.used) return res.status(400).json({ error: "Código ya usado" });
+    if (new Date() > oauthCode.expiresAt) return res.status(400).json({ error: "Código expirado" });
+    if (oauthCode.redirectUri !== redirectUri) return res.status(400).json({ error: "redirect_uri no coincide" });
+
+    // Marcar código como usado
+    await database.collection("oauth_codes").updateOne({ code }, { $set: { used: true } });
+
+    const scopes = oauthCode.scopes;
+
+    // Si pide scope "account" — dar token real completo (30 días)
+    if (scopes.includes("account")) {
+      const user = await database.collection("users").findOne({ username: oauthCode.username });
+      const isAdmin = oauthCode.username === ADMIN_USER;
+      
+      const fullToken = jwt.sign(
+        isAdmin
+          ? { username: oauthCode.username, role: "admin" }
+          : { userId: user._id.toString(), username: user.username, role: user.role },
+        SECRET,
+        { expiresIn: "30d" }
+      );
+
+      await database.collection("oauth_tokens").insertOne({
+        token: fullToken,
+        clientId,
+        username: oauthCode.username,
+        scopes,
+        type: "account",
+        createdAt: new Date(),
+        expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
+      });
+
+      return res.json({
+        access_token: fullToken,
+        token_type: "Bearer",
+        expires_in: 2592000,
+        scopes
+      });
+    }
+
+    // Token limitado por scopes (24 horas)
+    const scopedToken = jwt.sign(
+      { username: oauthCode.username, scopes, type: "oauth" },
+      SECRET,
+      { expiresIn: "24h" }
+    );
+
+    await database.collection("oauth_tokens").insertOne({
+      token: scopedToken,
+      clientId,
+      username: oauthCode.username,
+      scopes,
+      type: "scoped",
+      createdAt: new Date(),
+      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000)
+    });
+
+    res.json({
+      access_token: scopedToken,
+      token_type: "Bearer",
+      expires_in: 86400,
+      scopes
+    });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Revocar token OAuth
+app.post("/oauth/revoke", auth, async (req, res) => {
+  try {
+    const { token: tokenToRevoke } = req.body;
+    if (!tokenToRevoke) return res.status(400).json({ error: "token requerido" });
+    const database = await getDb();
+    await database.collection("oauth_tokens").deleteOne({
+      token: tokenToRevoke,
+      username: req.user.username
+    });
+    res.json({ ok: true });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Tokens activos del usuario
+app.get("/oauth/tokens", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const tokens = await database.collection("oauth_tokens")
+      .find({ username: req.user.username }, { projection: { token: 0 } })
+      .sort({ createdAt: -1 }).toArray();
+    res.json(tokens);
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Userinfo — para apps con scope "profile"
+app.get("/oauth/userinfo", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const isAdmin = req.user.role === "admin";
+    
+    if (isAdmin) {
+      return res.json({
+        username: req.user.username,
+        email: `${req.user.username}@${EMAIL_DOMAIN}`,
+        verified: true,
+        role: "admin",
+        neatPlus: true
+      });
+    }
+
+    const user = await database.collection("users")
+      .findOne({ username: req.user.username }, { projection: { passwordHash: 0 } });
+    if (!user) return res.status(404).json({ error: "Usuario no encontrado" });
+
+    // Respetar scopes si es token OAuth
+    const scopes = req.user.scopes || ["account"];
+    const response = { username: user.username };
+    if (scopes.includes("profile") || scopes.includes("account")) {
+      response.bio = user.bio || null;
+      response.avatarFileId = user.avatarFileId || null;
+      response.verified = !!user.verified;
+      response.neatPlus = !!user.neatPlus;
+      response.role = user.role;
+    }
+    if (scopes.includes("email") || scopes.includes("account")) {
+      response.email = user.email;
+    }
+
+    res.json(response);
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
 // ── Apps (público — sin cambios para Neat Astore) ─────────────────────────────
 app.get("/apps", async (req, res) => {
   const database = await getDb();
