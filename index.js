@@ -1310,7 +1310,7 @@ app.get("/u/:username", async (req, res) => {
         email: `${ADMIN_USER}@${EMAIL_DOMAIN}`,
         role: "admin",
         verified: true,
-        bio: null,
+        bio: "¡Hola! Soy el Creador de las apps de Neat. Si deseas contactarme, hazlo por Chatter.",
         avatarFileId: null,
         customLinks: [],
         neatPlus: true
