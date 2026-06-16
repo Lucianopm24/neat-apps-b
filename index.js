@@ -807,6 +807,21 @@ app.get("/apps/:id", async (req, res) => {
   }
 });
 
+// ── Verificación ──────────────────────────────────────────────────────────────
+app.put("/chat/users/:id/verify", adminAuth, async (req, res) => {
+  try {
+    const { verified } = req.body;
+    const database = await getDb();
+    await database.collection("users").updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { verified: !!verified } }
+    );
+    res.json({ ok: true, verified: !!verified });
+  } catch {
+    res.status(400).json({ error: "ID inválido" });
+  }
+});
+
 // ── Apps (admin — sin cambios) ─────────────────────────────────────────────────
 // Nota: usa `auth` (no `adminAuth`) para mantener compatibilidad con Neat Astore
 // que ya tenía tokens sin campo `role`. Tokens viejos siguen funcionando.
