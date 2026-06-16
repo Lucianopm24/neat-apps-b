@@ -1711,6 +1711,32 @@ app.get("/.well-known/jwks.json", (req, res) => {
   res.json({ keys: [] });
 });
 
+// Dar/quitar Neat Plus (admin)
+app.put("/neat/plus/admin", adminAuth, async (req, res) => {
+  try {
+    const { username, active, days } = req.body;
+    const database = await getDb();
+    const user = await database.collection("users").findOne({ username });
+    if (!user) return res.status(404).json({ error: "Usuario no encontrado" });
+    const expiresAt = active ? new Date(Date.now() + (days || 30) * 24 * 60 * 60 * 1000) : null;
+    await database.collection("users").updateOne(
+      { username },
+      { $set: { neatPlus: !!active, neatPlusExpiresAt: expiresAt } }
+    );
+    res.json({ ok: true, neatPlus: !!active, expiresAt });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Historial global de NP (admin)
+app.get("/neat/points/history/all", adminAuth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const history = await database.collection("np_history")
+      .find().sort({ createdAt: -1 }).limit(100).toArray();
+    res.json(history);
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
 // ── Apps (público — sin cambios para Neat Astore) ─────────────────────────────
 app.get("/apps", async (req, res) => {
   const database = await getDb();
