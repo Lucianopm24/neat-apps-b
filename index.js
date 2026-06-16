@@ -621,6 +621,7 @@ const users = await database.collection("users")
   .toArray();
 const verifiedMap = {};
 users.forEach(u => verifiedMap[u.username] = !!u.verified);
+verifiedMap[process.env.ADMIN_USER] = true; // admin siempre verificado
 
 const withVerified = videos.map(v => ({ ...v, uploaderVerified: verifiedMap[v.uploaderUsername] || false }));
 res.json(withVerified);
@@ -743,6 +744,7 @@ const users = await database.collection("users")
   .toArray();
 const verifiedMap = {};
 users.forEach(u => verifiedMap[u.username] = !!u.verified);
+verifiedMap[process.env.ADMIN_USER] = true; // admin siempre verificado
 
 res.json(comments.map(c => ({ ...c, authorVerified: verifiedMap[c.authorUsername] || false })));
   } catch {
