@@ -341,6 +341,11 @@ app.post("/chat/login", async (req, res) => {
 
     const valid = await bcrypt.compare(password, user.passwordHash);
     if (!valid) return res.status(401).json({ error: "Credenciales inválidas" });
+    if (user.suspended) return res.status(403).json({ 
+  error: "Cuenta suspendida", 
+  note: "Your account is suspended",
+  reason: user.suspendedReason || "Sin razón especificada"
+});
 
     const token = jwt.sign(
       { userId: user._id.toString(), username: user.username, role: user.role },
@@ -1475,6 +1480,12 @@ app.post("/oauth/authorize", auth, async (req, res) => {
     const database = await getDb();
 
     const client = await database.collection("oauth_clients").findOne({ clientId });
+    const userCheck = await database.collection("users").findOne({ username: req.user.username });
+if (userCheck?.suspended) return res.status(403).json({
+  error: "Cuenta suspendida",
+  note: "Your account is suspended", 
+  reason: userCheck.suspendedReason || "Sin razón especificada"
+});
     if (!client) return res.status(404).json({ error: "Cliente no encontrado" });
     if (!client.redirectUris.includes(redirectUri))
       return res.status(400).json({ error: "redirect_uri no autorizada" });
@@ -1639,6 +1650,22 @@ app.get("/oauth/userinfo", auth, async (req, res) => {
 
     res.json(response);
   } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+app.put("/chat/users/:id/suspend", adminAuth, async (req, res) => {
+  try {
+    const { suspended, reason } = req.body;
+    const database = await getDb();
+    await database.collection("users").updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { 
+        suspended: !!suspended,
+        suspendedReason: suspended ? (reason || "Sin razón especificada") : null,
+        suspendedAt: suspended ? new Date() : null
+      }}
+    );
+    res.json({ ok: true, suspended: !!suspended });
+  } catch { res.status(400).json({ error: "ID inválido" }); }
 });
 
 // ── Apps (público — sin cambios para Neat Astore) ─────────────────────────────
