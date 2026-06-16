@@ -1737,6 +1737,187 @@ app.get("/neat/points/history/all", adminAuth, async (req, res) => {
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
 
+// ── Neat Notes ────────────────────────────────────────────────────────────────
+
+const NOTE_ID_CHARS = 'abcdefghijklmnopqrstuvwxyz0123456789';
+function randomNoteId(len = 8) {
+  return Array.from(crypto.randomBytes(len))
+    .map(b => NOTE_ID_CHARS[b % NOTE_ID_CHARS.length]).join('');
+}
+
+// Crear nota
+app.post("/notes", auth, async (req, res) => {
+  try {
+    const { title, content, isPublic = true, password, customId } = req.body;
+    if (!content) return res.status(400).json({ error: "content requerido" });
+
+    const database = await getDb();
+    const user = req.user.role === "admin" ? null : 
+      await database.collection("users").findOne({ username: req.user.username });
+    const hasPlus = req.user.role === "admin" || !!user?.neatPlus;
+
+    // URL personalizada solo Plus
+    let noteId;
+    if (customId) {
+      if (!hasPlus) return res.status(403).json({ error: "Necesitas Neat Plus para URLs personalizadas" });
+      if (!/^[a-zA-Z0-9_-]{3,30}$/.test(customId))
+        return res.status(400).json({ error: "ID inválido (3-30 chars, letras/números/_/-)" });
+      const exists = await database.collection("notes").findOne({ noteId: customId });
+      if (exists) return res.status(409).json({ error: "Esa URL ya está en uso" });
+      noteId = customId;
+    } else {
+      noteId = randomNoteId();
+      // Garantizar unicidad
+      while (await database.collection("notes").findOne({ noteId })) {
+        noteId = randomNoteId();
+      }
+    }
+
+    // Contraseña solo Plus
+    let passwordHash = null;
+    if (password) {
+      if (!hasPlus) return res.status(403).json({ error: "Necesitas Neat Plus para notas con contraseña" });
+      passwordHash = await bcrypt.hash(password, 10);
+    }
+
+    const note = {
+      noteId,
+      title: title || null,
+      content,
+      authorUsername: req.user.username,
+      isPublic: !!isPublic,
+      passwordHash,
+      hasPassword: !!password,
+      history: [],
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    await database.collection("notes").insertOne(note);
+    res.status(201).json({ noteId, title: note.title, isPublic: note.isPublic, hasPassword: note.hasPassword, createdAt: note.createdAt });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// Ver nota por ID
+app.get("/notes/:id", async (req, res) => {
+  try {
+    const database = await getDb();
+    const note = await database.collection("notes").findOne({ noteId: req.params.id });
+    if (!note) return res.status(404).json({ error: "Nota no encontrada" });
+
+    // Si tiene contraseña, verificar
+    if (note.passwordHash) {
+      const { password } = req.query;
+      if (!password) return res.status(403).json({ error: "Nota protegida", protected: true });
+      const valid = await bcrypt.compare(password, note.passwordHash);
+      if (!valid) return res.status(403).json({ error: "Contraseña incorrecta", protected: true });
+    }
+
+    // Verificación del autor
+    const isAdmin = note.authorUsername === process.env.ADMIN_USER;
+    let verified = false;
+    if (isAdmin) {
+      verified = true;
+    } else {
+      const author = await database.collection("users")
+        .findOne({ username: note.authorUsername }, { projection: { verified: 1 } });
+      verified = !!author?.verified;
+    }
+
+    const { passwordHash, ...safe } = note;
+    res.json({ ...safe, authorVerified: verified });
+  } catch (err) {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// Mis notas
+app.get("/notes/me/list", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const notes = await database.collection("notes")
+      .find({ authorUsername: req.user.username }, { projection: { passwordHash: 0, content: 0, history: 0 } })
+      .sort({ updatedAt: -1 }).toArray();
+    res.json(notes);
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Editar nota
+app.put("/notes/:id", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const note = await database.collection("notes").findOne({ noteId: req.params.id });
+    if (!note) return res.status(404).json({ error: "Nota no encontrada" });
+    if (note.authorUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+
+    const { title, content, isPublic, password } = req.body;
+
+    // Guardar historial (máx 2 versiones)
+    const historyEntry = {
+      title: note.title,
+      content: note.content,
+      savedAt: note.updatedAt
+    };
+    const newHistory = [historyEntry, ...(note.history || [])].slice(0, 2);
+
+    const update = {
+      updatedAt: new Date(),
+      history: newHistory
+    };
+    if (title !== undefined) update.title = title;
+    if (content !== undefined) update.content = content;
+    if (isPublic !== undefined) update.isPublic = !!isPublic;
+
+    // Cambiar contraseña (solo Plus)
+    if (password !== undefined) {
+      const user = req.user.role === "admin" ? null :
+        await database.collection("users").findOne({ username: req.user.username });
+      const hasPlus = req.user.role === "admin" || !!user?.neatPlus;
+      if (!hasPlus) return res.status(403).json({ error: "Necesitas Neat Plus para notas con contraseña" });
+      update.passwordHash = password ? await bcrypt.hash(password, 10) : null;
+      update.hasPassword = !!password;
+    }
+
+    await database.collection("notes").updateOne({ noteId: req.params.id }, { $set: update });
+    res.json({ ok: true });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Ver historial (solo Plus)
+app.get("/notes/:id/history", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const note = await database.collection("notes").findOne({ noteId: req.params.id });
+    if (!note) return res.status(404).json({ error: "Nota no encontrada" });
+    if (note.authorUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+
+    const user = req.user.role === "admin" ? null :
+      await database.collection("users").findOne({ username: req.user.username });
+    const hasPlus = req.user.role === "admin" || !!user?.neatPlus;
+    if (!hasPlus) return res.status(403).json({ error: "Necesitas Neat Plus para ver el historial" });
+
+    res.json(note.history || []);
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Eliminar nota
+app.delete("/notes/:id", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const note = await database.collection("notes").findOne({ noteId: req.params.id });
+    if (!note) return res.status(404).json({ error: "Nota no encontrada" });
+    if (note.authorUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+    await database.collection("notes").deleteOne({ noteId: req.params.id });
+    res.json({ ok: true });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
 // ── Apps (público — sin cambios para Neat Astore) ─────────────────────────────
 app.get("/apps", async (req, res) => {
   const database = await getDb();
