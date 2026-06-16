@@ -856,20 +856,21 @@ app.get("/neat/points/balance", auth, async (req, res) => {
   try {
     if (req.user.role === "admin") return res.json({ points: Infinity, neatPlus: true });
     const database = await getDb();
-    const user = await database.collection("users")
+    let user = await database.collection("users")
       .findOne({ username: req.user.username }, { projection: { neatPoints: 1, neatPlus: 1, neatPlusExpiresAt: 1 } });
+    if (user && user.neatPoints === undefined) {
+      await database.collection("users").updateOne(
+        { username: req.user.username },
+        { $set: { neatPoints: 0 } }
+      );
+      user.neatPoints = 0; // actualizar en memoria también
+    }
     const expired = user?.neatPlusExpiresAt && new Date() > new Date(user.neatPlusExpiresAt);
     if (expired) await database.collection("users").updateOne(
       { username: req.user.username }, { $set: { neatPlus: false } }
     );
-    if (user && user.neatPoints === undefined) {
-  await database.collection("users").updateOne(
-    { username: req.user.username },
-    { $set: { neatPoints: 0 } }
-  );
-}
-res.json({
-  points: user?.neatPoints ?? 0,
+    res.json({
+      points: user?.neatPoints ?? 0,
       neatPlus: expired ? false : !!user?.neatPlus,
       expiresAt: expired ? null : user?.neatPlusExpiresAt || null
     });
