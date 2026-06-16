@@ -1491,7 +1491,7 @@ if (userCheck?.suspended) return res.status(403).json({
       return res.status(400).json({ error: "redirect_uri no autorizada" });
 
     // Validar scopes pedidos
-    const validScopes = ["profile", "email", "points", "chatter", "watch", "forums", "account"];
+    const validScopes = ["openid", "profile", "email", "points", "chatter", "watch", "forums", "account"];
     const requestedScopes = (scopes || ["profile"]).filter(s => validScopes.includes(s));
 
     const code = crypto.randomBytes(32).toString("hex");
@@ -1580,12 +1580,29 @@ app.post("/oauth/token", async (req, res) => {
       expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000)
     });
 
-    res.json({
-      access_token: scopedToken,
-      token_type: "Bearer",
-      expires_in: 86400,
-      scopes
-    });
+// Dentro de POST /oauth/token, antes del res.json final, agrega:
+let idToken = null;
+if (oauthCode.scopes.includes("openid")) {
+  idToken = jwt.sign({
+    iss: "https://neat-apps-b.vercel.app",
+    sub: oauthCode.username,
+    aud: clientId,
+    iat: Math.floor(Date.now() / 1000),
+    exp: Math.floor(Date.now() / 1000) + 86400,
+    username: oauthCode.username,
+    email: scopes.includes("email") ? user?.email : undefined,
+    verified: !!user?.verified,
+  }, SECRET, { algorithm: "HS256" });
+}
+
+// Y en el res.json:
+res.json({
+  access_token: scopedToken,
+  token_type: "Bearer",
+  expires_in: 86400,
+  scopes,
+  id_token: idToken || undefined
+});
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
 
@@ -1666,6 +1683,32 @@ app.put("/chat/users/:id/suspend", adminAuth, async (req, res) => {
     );
     res.json({ ok: true, suspended: !!suspended });
   } catch { res.status(400).json({ error: "ID inválido" }); }
+});
+
+// ── OpenID Connect ─────────────────────────────────────────────────────────────
+
+app.get("/.well-known/openid-configuration", (req, res) => {
+  const base = "https://neat-apps-b.vercel.app";
+  res.json({
+    issuer: base,
+    authorization_endpoint: "https://neat.qzz.io/oauth.html",
+    token_endpoint: `${base}/oauth/token`,
+    userinfo_endpoint: `${base}/oauth/userinfo`,
+    jwks_uri: `${base}/.well-known/jwks.json`,
+    registration_endpoint: `${base}/oauth/clients`,
+    scopes_supported: ["openid", "profile", "email", "points", "chatter", "watch", "forums", "account"],
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code"],
+    token_endpoint_auth_methods_supported: ["client_secret_post"],
+    subject_types_supported: ["public"],
+    id_token_signing_alg_values_supported: ["HS256"],
+    claims_supported: ["sub", "username", "email", "verified", "neatPlus", "role"]
+  });
+});
+
+app.get("/.well-known/jwks.json", (req, res) => {
+  // HS256 no usa JWKS real pero Gitea lo requiere
+  res.json({ keys: [] });
 });
 
 // ── Apps (público — sin cambios para Neat Astore) ─────────────────────────────
