@@ -818,6 +818,33 @@ res.json({ userId: req.params.userId, videos: videos.map(v => ({ ...v, uploaderV
   }
 });
 
+// ── Verificación ──────────────────────────────────────────────────────────────
+app.put("/chat/users/:id/verify", adminAuth, async (req, res) => {
+  try {
+    const { verified } = req.body;
+    const database = await getDb();
+    await database.collection("users").updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { verified: !!verified } }
+    );
+    res.json({ ok: true, verified: !!verified });
+  } catch {
+    res.status(400).json({ error: "ID inválido" });
+  }
+});
+
+app.get("/chat/users/:username/verified", async (req, res) => {
+  if (req.params.username === process.env.ADMIN_USER) return res.json({ verified: true });
+  try {
+    const database = await getDb();
+    const user = await database.collection("users")
+      .findOne({ username: req.params.username }, { projection: { verified: 1 } });
+    res.json({ verified: !!user?.verified });
+  } catch {
+    res.json({ verified: false });
+  }
+});
+
 // ── Apps (público — sin cambios para Neat Astore) ─────────────────────────────
 app.get("/apps", async (req, res) => {
   const database = await getDb();
@@ -833,21 +860,6 @@ app.get("/apps/:id", async (req, res) => {
     res.json(item);
   } catch {
     res.status(400).json({ error: "Invalid id" });
-  }
-});
-
-// ── Verificación ──────────────────────────────────────────────────────────────
-app.put("/chat/users/:id/verify", adminAuth, async (req, res) => {
-  try {
-    const { verified } = req.body;
-    const database = await getDb();
-    await database.collection("users").updateOne(
-      { _id: new ObjectId(req.params.id) },
-      { $set: { verified: !!verified } }
-    );
-    res.json({ ok: true, verified: !!verified });
-  } catch {
-    res.status(400).json({ error: "ID inválido" });
   }
 });
 
