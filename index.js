@@ -481,9 +481,9 @@ app.get("/chat/messages/:chatId", auth, async (req, res) => {
     const chat = await database.collection("chats").findOne({ _id: new ObjectId(req.params.chatId) });
     if (!chat) return res.status(404).json({ error: "Chat no encontrado" });
 
-    const identifier = req.user.userId || req.user.username;
-    if (!chat.participants.includes(identifier) && req.user.role !== "admin")
-      return res.status(403).json({ error: "No eres participante" });
+    const identifier = req.user.username;
+if (!chat.participants.includes(identifier) && req.user.role !== "admin")
+  return res.status(403).json({ error: "No eres participante" });
 
     const limit = Math.min(parseInt(req.query.limit) || 50, 100);
     const before = req.query.before ? new Date(req.query.before) : new Date();
@@ -514,7 +514,7 @@ app.post("/chat/messages/:chatId", auth, async (req, res) => {
 
    const identifier = req.user.username;
 if (!chat.participants.includes(identifier) && req.user.role !== "admin")
-      return res.status(403).json({ error: "No eres participante" });
+  return res.status(403).json({ error: "No eres participante" });
 
     const message = {
       chatId: req.params.chatId,
