@@ -925,32 +925,50 @@ app.get("/neat/points/history", auth, async (req, res) => {
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
 
-// Exchange LUCKS de InnerNet → NP (opcional, solo si tienes cuenta InnerNet)
 app.post("/neat/points/exchange", auth, async (req, res) => {
   try {
-    const { lucks, innernetToken } = req.body;
-    if (!lucks || lucks <= 0) return res.status(400).json({ error: "Cantidad inválida" });
-    if (lucks % 12 !== 0) return res.status(400).json({ error: "Debe ser múltiplo de 12 LUCKS" });
+    const { lucks, innernetUsername, innernetPassword } = req.body;
+    if (!lucks || lucks <= 0 || lucks % 12 !== 0)
+      return res.status(400).json({ error: "Debe ser múltiplo de 12 LUCKS" });
+    if (!innernetUsername || !innernetPassword)
+      return res.status(400).json({ error: "Credenciales de InnerNet requeridas" });
 
-    // Verificar y descontar LUCKS en InnerNet
-    const deductRes = await fetch(`${INNERNET_API}/lucks/add`, {
+    // Paso 1 — Login en InnerNet para obtener token
+    const loginRes = await fetch(`${INNERNET_API}/auth/login`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": INNERNET_EXCHANGE_KEY },
-      body: JSON.stringify({ username: req.body.innernetUsername, amount: -lucks })
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: innernetUsername, password: innernetPassword })
     });
-    if (!deductRes.ok) {
-      const err = await deductRes.json();
-      return res.status(400).json({ error: err.error || "Error en InnerNet" });
-    }
+    const loginData = await loginRes.json();
+    if (!loginRes.ok) return res.status(401).json({ error: "Credenciales de InnerNet inválidas" });
+    if (loginData.requiresTwoFactor)
+      return res.status(400).json({ error: "Tu cuenta de InnerNet tiene 2FA activado, desactívalo para hacer exchange" });
 
-    const np = Math.floor(lucks / 12);
+    // Paso 2 — Descontar LUCKS en InnerNet
+    const exchangeRes = await fetch(`${INNERNET_API}/exchange/lucks-to-neat`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${loginData.token}`
+      },
+      body: JSON.stringify({
+        lucks,
+        neatUsername: req.user.username,
+        neatKey: process.env.INNERNET_EXCHANGE_KEY
+      })
+    });
+    const exchangeData = await exchangeRes.json();
+    if (!exchangeRes.ok) return res.status(exchangeRes.status).json(exchangeData);
+
+    // Paso 3 — Acreditar NP en Neat
+    const np = exchangeData.npToCredit;
     const database = await getDb();
     await database.collection("users").updateOne(
       { username: req.user.username }, { $inc: { neatPoints: np } }
     );
     await database.collection("np_history").insertOne({
-      from: "InnerNet", to: req.user.username, amount: np,
-      type: "exchange", lucksSpent: lucks, createdAt: new Date()
+      from: `InnerNet:${innernetUsername}`, to: req.user.username,
+      amount: np, type: "exchange", lucksSpent: lucks, createdAt: new Date()
     });
     res.json({ ok: true, npReceived: np, lucksSpent: lucks });
   } catch { res.status(500).json({ error: "Error interno" }); }
