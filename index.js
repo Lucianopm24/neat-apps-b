@@ -800,10 +800,19 @@ app.get("/watch/channels/:userId", async (req, res) => {
   try {
     const database = await getDb();
     const videos = await database.collection("watch_videos")
-      .find({ uploadedBy: req.params.userId }).sort({ createdAt: -1 }).toArray();
-    const subscriberCount = await database.collection("watch_subscriptions")
-      .countDocuments({ channelId: req.params.userId });
-    res.json({ userId: req.params.userId, videos, subscriberCount });
+  .find({ uploadedBy: req.params.userId }).sort({ createdAt: -1 }).toArray();
+const subscriberCount = await database.collection("watch_subscriptions")
+  .countDocuments({ channelId: req.params.userId });
+
+const usernames = [...new Set(videos.map(v => v.uploaderUsername))];
+const users = await database.collection("users")
+  .find({ username: { $in: usernames } }, { projection: { username: 1, verified: 1 } })
+  .toArray();
+const verifiedMap = {};
+users.forEach(u => verifiedMap[u.username] = !!u.verified);
+verifiedMap[process.env.ADMIN_USER] = true;
+
+res.json({ userId: req.params.userId, videos: videos.map(v => ({ ...v, uploaderVerified: verifiedMap[v.uploaderUsername] || false })), subscriberCount });
   } catch (err) {
     res.status(500).json({ error: "Error interno" });
   }
