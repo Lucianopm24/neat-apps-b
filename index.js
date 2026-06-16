@@ -845,6 +845,162 @@ app.get("/chat/users/:username/verified", async (req, res) => {
   }
 });
 
+// ── Neat Points (powered by LUCKS de InnerNet) ────────────────────────────────
+
+const INNERNET_API = "https://own-net.vercel.app";
+const NEAT_EXCHANGE_KEY = process.env.NEAT_EXCHANGE_KEY; // clave secreta compartida
+
+// Ver balance de LUCKS del usuario en InnerNet
+app.get("/neat/lucks/balance", auth, async (req, res) => {
+  try {
+    const r = await fetch(`${INNERNET_API}/me`, {
+      headers: { "Authorization": req.headers.authorization }
+    });
+    if (!r.ok) return res.status(401).json({ error: "Token de InnerNet inválido" });
+    const d = await r.json();
+    res.json({ username: d.username, lucks: d.lucks });
+  } catch {
+    res.status(500).json({ error: "Error conectando con InnerNet" });
+  }
+});
+
+// Transferir LUCKS entre usuarios de InnerNet desde Neat
+app.post("/neat/lucks/transfer", auth, async (req, res) => {
+  try {
+    const { to, amount } = req.body;
+    if (!to || !amount || amount <= 0)
+      return res.status(400).json({ error: "Faltan campos" });
+    const r = await fetch(`${INNERNET_API}/lucks/transfer`, {
+      method: "POST",
+      headers: {
+        "Authorization": req.headers.authorization,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ to, amount })
+    });
+    const d = await r.json();
+    if (!r.ok) return res.status(r.status).json(d);
+    res.json(d);
+  } catch {
+    res.status(500).json({ error: "Error conectando con InnerNet" });
+  }
+});
+
+// Ver historial de transferencias (guardado en Neat)
+app.get("/neat/lucks/history", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const identifier = req.user.username;
+    const history = await database.collection("lucks_history")
+      .find({ $or: [{ from: identifier }, { to: identifier }] })
+      .sort({ createdAt: -1 }).limit(50).toArray();
+    res.json(history);
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// Admin añade LUCKS a un usuario en InnerNet desde Neat
+app.post("/neat/lucks/add", auth, async (req, res) => {
+  try {
+    if (req.user.role !== "admin") return res.status(403).json({ error: "Solo admin" });
+    const { username, amount } = req.body;
+    if (!username || !amount || amount <= 0)
+      return res.status(400).json({ error: "Faltan campos" });
+    const r = await fetch(`${INNERNET_API}/lucks/add`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": NEAT_EXCHANGE_KEY
+      },
+      body: JSON.stringify({ username, amount })
+    });
+    const d = await r.json();
+    if (!r.ok) return res.status(r.status).json(d);
+
+    // Guardar en historial
+    const database = await getDb();
+    await database.collection("lucks_history").insertOne({
+      from: "admin",
+      to: username,
+      amount,
+      type: "admin_grant",
+      createdAt: new Date()
+    });
+    res.json(d);
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// Neat Plus — activar con LUCKS
+const NEAT_PLUS_PRICE = 500; // LUCKS
+
+app.post("/neat/plus/activate", auth, async (req, res) => {
+  try {
+    // Verificar balance en InnerNet
+    const balanceRes = await fetch(`${INNERNET_API}/me`, {
+      headers: { "Authorization": req.headers.authorization }
+    });
+    if (!balanceRes.ok) return res.status(401).json({ error: "Token de InnerNet inválido" });
+    const { lucks, username } = await balanceRes.json();
+
+    if (lucks < NEAT_PLUS_PRICE)
+      return res.status(400).json({ error: `No tienes suficientes LUCKS. Necesitas ${NEAT_PLUS_PRICE}, tienes ${lucks}` });
+
+    // Descontar LUCKS en InnerNet
+    const deductRes = await fetch(`${INNERNET_API}/lucks/add`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": NEAT_EXCHANGE_KEY },
+      body: JSON.stringify({ username, amount: -NEAT_PLUS_PRICE })
+    });
+    if (!deductRes.ok) return res.status(500).json({ error: "Error descontando LUCKS" });
+
+    // Activar Neat Plus en MongoDB de Neat
+    const database = await getDb();
+    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 días
+    await database.collection("users").updateOne(
+      { username: req.user.username },
+      { $set: { neatPlus: true, neatPlusExpiresAt: expiresAt } }
+    );
+
+    // Guardar en historial
+    await database.collection("lucks_history").insertOne({
+      from: username,
+      to: "Neat",
+      amount: NEAT_PLUS_PRICE,
+      type: "neat_plus",
+      createdAt: new Date()
+    });
+
+    res.json({ ok: true, neatPlus: true, expiresAt, lucksSpent: NEAT_PLUS_PRICE });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// Ver estado de Neat Plus
+app.get("/neat/plus/status", auth, async (req, res) => {
+  try {
+    if (req.user.role === "admin") return res.json({ neatPlus: true, forever: true });
+    const database = await getDb();
+    const user = await database.collection("users")
+      .findOne({ username: req.user.username }, { projection: { neatPlus: 1, neatPlusExpiresAt: 1 } });
+
+    const expired = user?.neatPlusExpiresAt && new Date() > new Date(user.neatPlusExpiresAt);
+    if (expired) {
+      await database.collection("users").updateOne(
+        { username: req.user.username },
+        { $set: { neatPlus: false } }
+      );
+      return res.json({ neatPlus: false });
+    }
+    res.json({ neatPlus: !!user?.neatPlus, expiresAt: user?.neatPlusExpiresAt || null });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
 // ── Apps (público — sin cambios para Neat Astore) ─────────────────────────────
 app.get("/apps", async (req, res) => {
   const database = await getDb();
