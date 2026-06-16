@@ -1011,6 +1011,253 @@ app.get("/neat/plus/status", auth, async (req, res) => {
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
 
+// ── Neat Forums ───────────────────────────────────────────────────────────────
+
+app.get("/forums/communities", async (req, res) => {
+  try {
+    const database = await getDb();
+    const communities = await database.collection("forum_communities")
+      .find().sort({ members: -1 }).toArray();
+    res.json(communities);
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+app.post("/forums/communities", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const user = await database.collection("users").findOne({ username: req.user.username });
+    const isAdmin = req.user.role === "admin";
+    if (!isAdmin && !user?.neatPlus) return res.status(403).json({ error: "Necesitas Neat Plus para crear comunidades" });
+
+    const { name, description } = req.body;
+    if (!name) return res.status(400).json({ error: "Nombre requerido" });
+    if (!/^[a-zA-Z0-9_]{3,30}$/.test(name)) return res.status(400).json({ error: "Nombre inválido (solo letras, números y _)" });
+
+    const exists = await database.collection("forum_communities").findOne({ name });
+    if (exists) return res.status(400).json({ error: "Comunidad ya existe" });
+
+    const community = {
+      name, description: description || "",
+      createdBy: req.user.username,
+      members: 1, createdAt: new Date()
+    };
+    const result = await database.collection("forum_communities").insertOne(community);
+    await database.collection("forum_members").insertOne({
+      communityName: name, username: req.user.username, joinedAt: new Date()
+    });
+    res.json({ ...community, _id: result.insertedId });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+app.get("/forums/communities/:name", async (req, res) => {
+  try {
+    const database = await getDb();
+    const community = await database.collection("forum_communities").findOne({ name: req.params.name });
+    if (!community) return res.status(404).json({ error: "Comunidad no encontrada" });
+    res.json(community);
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+app.post("/forums/communities/:name/join", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const community = await database.collection("forum_communities").findOne({ name: req.params.name });
+    if (!community) return res.status(404).json({ error: "Comunidad no encontrada" });
+    const already = await database.collection("forum_members").findOne({ communityName: req.params.name, username: req.user.username });
+    if (already) return res.json({ ok: true });
+    await database.collection("forum_members").insertOne({ communityName: req.params.name, username: req.user.username, joinedAt: new Date() });
+    await database.collection("forum_communities").updateOne({ name: req.params.name }, { $inc: { members: 1 } });
+    res.json({ ok: true });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Posts
+app.get("/forums/posts", async (req, res) => {
+  try {
+    const database = await getDb();
+    const filter = {};
+    if (req.query.community) filter.community = req.query.community;
+    const posts = await database.collection("forum_posts")
+      .find(filter).sort({ score: -1, createdAt: -1 }).limit(50).toArray();
+    res.json(posts);
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+app.post("/forums/posts", auth, async (req, res) => {
+  try {
+    const { title, body, community, anonymous } = req.body;
+    if (!title || !community) return res.status(400).json({ error: "Título y comunidad requeridos" });
+
+    const database = await getDb();
+    const isMember = await database.collection("forum_members").findOne({ communityName: community, username: req.user.username });
+    if (!isMember) return res.status(403).json({ error: "Únete a la comunidad primero" });
+
+    let authorUsername = req.user.username;
+    if (anonymous) {
+      const user = await database.collection("users").findOne({ username: req.user.username });
+      const isAdmin = req.user.role === "admin";
+      if (!isAdmin && !user?.neatPlus) return res.status(403).json({ error: "Necesitas Neat Plus para postear anónimo" });
+      authorUsername = "anónimo";
+    }
+
+    const post = {
+      title, body: body || "", community,
+      authorUsername, realAuthor: req.user.username,
+      anonymous: !!anonymous, score: 0,
+      upvotes: 0, downvotes: 0, commentCount: 0,
+      createdAt: new Date(), editedAt: null
+    };
+    const result = await database.collection("forum_posts").insertOne(post);
+    res.json({ ...post, _id: result.insertedId });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+app.put("/forums/posts/:id", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const post = await database.collection("forum_posts").findOne({ _id: new ObjectId(req.params.id) });
+    if (!post) return res.status(404).json({ error: "Post no encontrado" });
+    if (post.realAuthor !== req.user.username && req.user.role !== "admin") return res.status(403).json({ error: "No autorizado" });
+
+    const user = await database.collection("users").findOne({ username: req.user.username });
+    const isAdmin = req.user.role === "admin";
+    if (!isAdmin && !user?.neatPlus) return res.status(403).json({ error: "Necesitas Neat Plus para editar posts" });
+
+    const { title, body } = req.body;
+    await database.collection("forum_posts").updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { title: title || post.title, body: body || post.body, editedAt: new Date() } }
+    );
+    res.json({ ok: true });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+app.delete("/forums/posts/:id", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const post = await database.collection("forum_posts").findOne({ _id: new ObjectId(req.params.id) });
+    if (!post) return res.status(404).json({ error: "Post no encontrado" });
+    if (post.realAuthor !== req.user.username && req.user.role !== "admin") return res.status(403).json({ error: "No autorizado" });
+    await database.collection("forum_posts").deleteOne({ _id: new ObjectId(req.params.id) });
+    await database.collection("forum_comments").deleteMany({ postId: req.params.id });
+    res.json({ ok: true });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+app.post("/forums/posts/:id/vote", auth, async (req, res) => {
+  try {
+    const { vote } = req.body; // 1 o -1
+    if (vote !== 1 && vote !== -1) return res.status(400).json({ error: "Voto inválido" });
+
+    const database = await getDb();
+    const postId = req.params.id;
+    const existing = await database.collection("forum_votes").findOne({ postId, username: req.user.username });
+
+    if (existing) {
+      if (existing.vote === vote) {
+        // quitar voto
+        await database.collection("forum_votes").deleteOne({ postId, username: req.user.username });
+        await database.collection("forum_posts").updateOne(
+          { _id: new ObjectId(postId) },
+          { $inc: { score: -vote, upvotes: vote === 1 ? -1 : 0, downvotes: vote === -1 ? -1 : 0 } }
+        );
+        return res.json({ ok: true, removed: true });
+      } else {
+        // cambiar voto
+        await database.collection("forum_votes").updateOne({ postId, username: req.user.username }, { $set: { vote } });
+        await database.collection("forum_posts").updateOne(
+          { _id: new ObjectId(postId) },
+          { $inc: { score: vote * 2, upvotes: vote === 1 ? 1 : -1, downvotes: vote === -1 ? 1 : -1 } }
+        );
+        return res.json({ ok: true, changed: true });
+      }
+    }
+
+    await database.collection("forum_votes").insertOne({ postId, username: req.user.username, vote, createdAt: new Date() });
+    await database.collection("forum_posts").updateOne(
+      { _id: new ObjectId(postId) },
+      { $inc: { score: vote, upvotes: vote === 1 ? 1 : 0, downvotes: vote === -1 ? 1 : 0 } }
+    );
+    res.json({ ok: true });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Comentarios
+app.get("/forums/posts/:id/comments", async (req, res) => {
+  try {
+    const database = await getDb();
+    const comments = await database.collection("forum_comments")
+      .find({ postId: req.params.id }).sort({ createdAt: 1 }).toArray();
+    res.json(comments);
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+app.post("/forums/posts/:id/comments", auth, async (req, res) => {
+  try {
+    const { body } = req.body;
+    if (!body) return res.status(400).json({ error: "Comentario vacío" });
+    const database = await getDb();
+    const comment = {
+      postId: req.params.id, body,
+      authorUsername: req.user.username,
+      createdAt: new Date()
+    };
+    await database.collection("forum_comments").insertOne(comment);
+    await database.collection("forum_posts").updateOne(
+      { _id: new ObjectId(req.params.id) }, { $inc: { commentCount: 1 } }
+    );
+    res.json(comment);
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Guardados
+app.post("/forums/posts/:id/save", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const user = await database.collection("users").findOne({ username: req.user.username });
+    const isAdmin = req.user.role === "admin";
+    if (!isAdmin && !user?.neatPlus) return res.status(403).json({ error: "Necesitas Neat Plus para guardar posts" });
+
+    const existing = await database.collection("forum_saved").findOne({ postId: req.params.id, username: req.user.username });
+    if (existing) {
+      await database.collection("forum_saved").deleteOne({ postId: req.params.id, username: req.user.username });
+      return res.json({ ok: true, saved: false });
+    }
+    await database.collection("forum_saved").insertOne({ postId: req.params.id, username: req.user.username, savedAt: new Date() });
+    res.json({ ok: true, saved: true });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+app.get("/forums/saved", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const user = await database.collection("users").findOne({ username: req.user.username });
+    const isAdmin = req.user.role === "admin";
+    if (!isAdmin && !user?.neatPlus) return res.status(403).json({ error: "Necesitas Neat Plus" });
+
+    const saved = await database.collection("forum_saved")
+      .find({ username: req.user.username }).sort({ savedAt: -1 }).toArray();
+    const postIds = saved.map(s => new ObjectId(s.postId));
+    const posts = await database.collection("forum_posts")
+      .find({ _id: { $in: postIds } }).toArray();
+    res.json(posts);
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Ver upvoters (solo Plus)
+app.get("/forums/posts/:id/upvoters", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const user = await database.collection("users").findOne({ username: req.user.username });
+    const isAdmin = req.user.role === "admin";
+    if (!isAdmin && !user?.neatPlus) return res.status(403).json({ error: "Necesitas Neat Plus" });
+
+    const votes = await database.collection("forum_votes")
+      .find({ postId: req.params.id, vote: 1 }).toArray();
+    res.json(votes.map(v => v.username));
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
 // ── Apps (público — sin cambios para Neat Astore) ─────────────────────────────
 app.get("/apps", async (req, res) => {
   const database = await getDb();
