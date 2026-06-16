@@ -880,7 +880,7 @@ const NEAT_PLUS_PRICE = 500; // NP
 // Ver balance de NP
 app.get("/neat/points/balance", auth, async (req, res) => {
   try {
-    if (req.user.role === "admin") return res.json({ points: Infinity, neatPlus: true });
+    if (req.user.role === "admin") return res.json({ points: 999999999, neatPlus: true, forever: true });
     const database = await getDb();
     let user = await database.collection("users")
       .findOne({ username: req.user.username }, { projection: { neatPoints: 1, neatPlus: 1, neatPlusExpiresAt: 1 } });
