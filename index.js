@@ -1785,7 +1785,7 @@ app.post("/notes", auth, async (req, res) => {
       title: title || null,
       content,
       authorUsername: req.user.username,
-      isPublic: !!isPublic,
+      visibility: ['public','unlisted','private'].includes(visibility) ? visibility : 'public',
       passwordHash,
       hasPassword: !!password,
       history: [],
@@ -1915,6 +1915,23 @@ app.delete("/notes/:id", auth, async (req, res) => {
       return res.status(403).json({ error: "Sin permisos" });
     await database.collection("notes").deleteOne({ noteId: req.params.id });
     res.json({ ok: true });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+app.get("/notes", async (req, res) => {
+  try {
+    const database = await getDb();
+    const notes = await database.collection("notes")
+      .find({ visibility: 'public' }, { projection: { passwordHash: 0, content: 0, history: 0 } })
+      .sort({ createdAt: -1 }).limit(30).toArray();
+    const usernames = [...new Set(notes.map(n => n.authorUsername))];
+    const users = await database.collection("users")
+      .find({ username: { $in: usernames } }, { projection: { username: 1, verified: 1 } })
+      .toArray();
+    const verifiedMap = {};
+    users.forEach(u => verifiedMap[u.username] = !!u.verified);
+    verifiedMap[process.env.ADMIN_USER] = true;
+    res.json(notes.map(n => ({ ...n, authorVerified: verifiedMap[n.authorUsername] || false })));
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
 
