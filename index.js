@@ -735,8 +735,16 @@ app.get("/watch/videos/:id/comments", async (req, res) => {
   try {
     const database = await getDb();
     const comments = await database.collection("watch_comments")
-      .find({ videoId: req.params.id }).sort({ createdAt: 1 }).toArray();
-    res.json(comments);
+  .find({ videoId: req.params.id }).sort({ createdAt: 1 }).toArray();
+
+const usernames = [...new Set(comments.map(c => c.authorUsername))];
+const users = await database.collection("users")
+  .find({ username: { $in: usernames } }, { projection: { username: 1, verified: 1 } })
+  .toArray();
+const verifiedMap = {};
+users.forEach(u => verifiedMap[u.username] = !!u.verified);
+
+res.json(comments.map(c => ({ ...c, authorVerified: verifiedMap[c.authorUsername] || false })));
   } catch {
     res.status(400).json({ error: "Error" });
   }
