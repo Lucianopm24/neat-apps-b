@@ -845,6 +845,20 @@ app.get("/chat/users/:username/verified", async (req, res) => {
   }
 });
 
+app.put("/chat/chats/:id", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const { participants } = req.body;
+    if (!participants || !Array.isArray(participants))
+      return res.status(400).json({ error: "participants requerido" });
+    await database.collection("chats").updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { participants } }
+    );
+    res.json({ ok: true });
+  } catch { res.status(400).json({ error: "ID inválido" }); }
+});
+
 // ── Neat Points ───────────────────────────────────────────────────────────────
 
 const INNERNET_API = "https://own-net.vercel.app";
