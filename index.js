@@ -592,6 +592,7 @@ app.post("/watch/videos", auth, async (req, res) => {
       title, description, fileId, thumbnailFileId: thumbnailFileId || null,
       duration: duration || null, category: category || null,
       uploadedBy: identifier, uploaderUsername: req.user.username,
+uploaderVerified: false,
       likes: [], views: 0, createdAt: new Date()
     });
     res.status(201).json({ _id: result.insertedId, title, fileId });
@@ -612,8 +613,17 @@ app.get("/watch/videos", async (req, res) => {
     if (before) filter.createdAt = { $lt: new Date(before) };
 
     const videos = await database.collection("watch_videos")
-      .find(filter).sort({ createdAt: -1 }).limit(parseInt(limit)).toArray();
-    res.json(videos);
+  .find(filter).sort({ createdAt: -1 }).limit(parseInt(limit)).toArray();
+
+const usernames = [...new Set(videos.map(v => v.uploaderUsername))];
+const users = await database.collection("users")
+  .find({ username: { $in: usernames } }, { projection: { username: 1, verified: 1 } })
+  .toArray();
+const verifiedMap = {};
+users.forEach(u => verifiedMap[u.username] = !!u.verified);
+
+const withVerified = videos.map(v => ({ ...v, uploaderVerified: verifiedMap[v.uploaderUsername] || false }));
+res.json(withVerified);
   } catch (err) {
     res.status(500).json({ error: "Error interno" });
   }
