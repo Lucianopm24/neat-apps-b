@@ -862,8 +862,14 @@ app.get("/neat/points/balance", auth, async (req, res) => {
     if (expired) await database.collection("users").updateOne(
       { username: req.user.username }, { $set: { neatPlus: false } }
     );
-    res.json({
-      points: user?.neatPoints || 0,
+    if (user && user.neatPoints === undefined) {
+  await database.collection("users").updateOne(
+    { username: req.user.username },
+    { $set: { neatPoints: 0 } }
+  );
+}
+res.json({
+  points: user?.neatPoints ?? 0,
       neatPlus: expired ? false : !!user?.neatPlus,
       expiresAt: expired ? null : user?.neatPlusExpiresAt || null
     });
