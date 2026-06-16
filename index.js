@@ -1291,30 +1291,6 @@ app.get("/forums/posts/:id/upvoters", auth, async (req, res) => {
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
 
-app.post("/admin/fix-participants", adminAuth, async (req, res) => {
-  try {
-    const database = await getDb();
-    const chats = await database.collection("chats").find().toArray();
-    const users = await database.collection("users").find().toArray();
-    let fixed = 0;
-    for (const chat of chats) {
-      const newParticipants = chat.participants.map(p => {
-        if (!/^[0-9a-f]{24}$/i.test(p)) return p; // ya es username
-        const user = users.find(u => u._id.toString() === p);
-        return user ? user.username : p;
-      });
-      if (JSON.stringify(newParticipants) !== JSON.stringify(chat.participants)) {
-        await database.collection("chats").updateOne(
-          { _id: chat._id },
-          { $set: { participants: newParticipants } }
-        );
-        fixed++;
-      }
-    }
-    res.json({ ok: true, fixed });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
 // ── Apps (público — sin cambios para Neat Astore) ─────────────────────────────
 app.get("/apps", async (req, res) => {
   const database = await getDb();
