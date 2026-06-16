@@ -415,8 +415,9 @@ app.put("/chat/users/:id/role", adminAuth, async (req, res) => {
 app.get("/chat/chats", auth, async (req, res) => {
   const database = await getDb();
   const identifier = req.user.username;
+const userId = req.user.userId;
 const chats = await database.collection("chats")
-  .find({ participants: identifier })
+  .find({ participants: { $in: [identifier, userId].filter(Boolean) } })
     .sort({ updatedAt: -1 })
     .toArray();
   res.json(chats);
