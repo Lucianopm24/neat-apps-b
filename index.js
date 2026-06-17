@@ -151,6 +151,26 @@ async function notifyParticipants(database, chatId, message, senderIdentifier) {
       })
     )
   );
+
+  // ntfy para usuarios Plus
+  for (const username of recipients) {
+    const recipientUser = await database.collection("users").findOne(
+      { username },
+      { projection: { ntfyTopic: 1, neatPlus: 1 } }
+    );
+    if (!recipientUser?.ntfyTopic || !recipientUser?.neatPlus) continue;
+    const chatUrl = `https://neat.qzz.io/byneat/chatter?chat=${chatId}`;
+    fetch(`https://push.tchncs.de/${recipientUser.ntfyTopic}`, {
+      method: "POST",
+      headers: {
+        "Title": `Nuevo mensaje de ${message.senderUsername}`,
+        "Priority": "default",
+        "Actions": `view, Responder, ${chatUrl}`,
+        "Content-Type": "text/plain"
+      },
+      body: message.content || `[${message.type}]`
+    }).catch(() => {});
+  }
 }
 
 // ── Guardar suscripción push del browser ───────────────────────────────────────
@@ -2263,6 +2283,34 @@ app.put("/watch/lists/:id", auth, async (req, res) => {
       { $set: { nombre, updatedAt: new Date() } }
     );
     res.json({ ok: true });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// ── Neat ntfy ─────────────────────────────────────────────────────────────────
+
+// Generar/obtener topic ntfy
+app.post("/ntfy/setup", auth, async (req, res) => {
+  try {
+    if (req.user.role === "admin") return res.json({ ok: true, topic: "admin_no_necesita" });
+    const database = await getDb();
+    const user = await database.collection("users").findOne({ username: req.user.username });
+    if (!user?.neatPlus) return res.status(403).json({ error: "Necesitas Neat Plus" });
+    if (user.ntfyTopic) return res.json({ ok: true, topic: user.ntfyTopic });
+    const topic = "neat_" + crypto.randomBytes(8).toString("hex");
+    await database.collection("users").updateOne(
+      { username: req.user.username },
+      { $set: { ntfyTopic: topic } }
+    );
+    res.json({ ok: true, topic });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Ver topic actual
+app.get("/ntfy/topic", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const user = await database.collection("users").findOne({ username: req.user.username });
+    res.json({ topic: user?.ntfyTopic || null });
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
 
