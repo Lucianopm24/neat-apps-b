@@ -1331,6 +1331,12 @@ app.get("/u/:username", async (req, res) => {
       { label: "Neat Points", url: `https://neat.qzz.io/byneat/points`, icon: "💰", auto: true },
     ];
 
+   // Contar visita (no contar al propio usuario — no tenemos auth aquí, así que contamos siempre)
+    await database.collection("users").updateOne(
+      { username: { $regex: new RegExp(`^${req.params.username}$`, "i") } },
+      { $inc: { profileViews: 1 } }
+    );
+
     res.json({
       username: profile.username,
       email: profile.email,
@@ -1342,7 +1348,8 @@ app.get("/u/:username", async (req, res) => {
       customLinks: profile.customLinks || [],
       customCategories: profile.customCategories || [],
       autoLinks,
-      hasCustomWeb: !!profile.customWeb
+      hasCustomWeb: !!profile.customWeb,
+      profileViews: profile.profileViews || 0
     });
   } catch (err) {
     res.status(500).json({ error: "Error interno" });
