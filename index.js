@@ -2133,6 +2133,128 @@ app.get("/watch/history", auth, async (req, res) => {
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
 
+// ── Watch — Listas de reproducción ───────────────────────────────────────────
+
+function randomListId(len = 8) {
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  return Array.from(crypto.randomBytes(len))
+    .map(b => chars[b % chars.length]).join('');
+}
+
+// Crear lista
+app.post("/watch/lists", auth, async (req, res) => {
+  try {
+    const { nombre } = req.body;
+    if (!nombre) return res.status(400).json({ error: "nombre requerido" });
+    const database = await getDb();
+    let listId = randomListId();
+    while (await database.collection("watch_lists").findOne({ listId })) listId = randomListId();
+    const lista = {
+      listId, nombre,
+      creatorUsername: req.user.username,
+      videos: [],
+      createdAt: new Date(), updatedAt: new Date()
+    };
+    await database.collection("watch_lists").insertOne(lista);
+    res.status(201).json({ listId, nombre });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Ver lista por ID (público)
+app.get("/watch/lists/:id", async (req, res) => {
+  try {
+    const database = await getDb();
+    const lista = await database.collection("watch_lists").findOne({ listId: req.params.id });
+    if (!lista) return res.status(404).json({ error: "Lista no encontrada" });
+    const videoIds = lista.videos.map(id => { try { return new ObjectId(id); } catch { return null; } }).filter(Boolean);
+    const videos = videoIds.length
+      ? await database.collection("watch_videos").find({ _id: { $in: videoIds } }).toArray()
+      : [];
+    const videoMap = {};
+    videos.forEach(v => videoMap[v._id.toString()] = v);
+    const ordered = lista.videos.map(id => videoMap[id]).filter(Boolean);
+    res.json({ ...lista, videos: ordered });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Mis listas
+app.get("/watch/lists/me/list", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const listas = await database.collection("watch_lists")
+      .find({ creatorUsername: req.user.username })
+      .sort({ updatedAt: -1 }).toArray();
+    res.json(listas);
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Añadir video a lista
+app.post("/watch/lists/:id/videos", auth, async (req, res) => {
+  try {
+    const { videoId } = req.body;
+    if (!videoId) return res.status(400).json({ error: "videoId requerido" });
+    const database = await getDb();
+    const lista = await database.collection("watch_lists").findOne({ listId: req.params.id });
+    if (!lista) return res.status(404).json({ error: "Lista no encontrada" });
+    if (lista.creatorUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+    if (lista.videos.includes(videoId))
+      return res.status(409).json({ error: "Video ya está en la lista" });
+    await database.collection("watch_lists").updateOne(
+      { listId: req.params.id },
+      { $push: { videos: videoId }, $set: { updatedAt: new Date() } }
+    );
+    res.json({ ok: true });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Quitar video de lista
+app.delete("/watch/lists/:id/videos/:videoId", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const lista = await database.collection("watch_lists").findOne({ listId: req.params.id });
+    if (!lista) return res.status(404).json({ error: "Lista no encontrada" });
+    if (lista.creatorUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+    await database.collection("watch_lists").updateOne(
+      { listId: req.params.id },
+      { $pull: { videos: req.params.videoId }, $set: { updatedAt: new Date() } }
+    );
+    res.json({ ok: true });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Eliminar lista
+app.delete("/watch/lists/:id", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const lista = await database.collection("watch_lists").findOne({ listId: req.params.id });
+    if (!lista) return res.status(404).json({ error: "Lista no encontrada" });
+    if (lista.creatorUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+    await database.collection("watch_lists").deleteOne({ listId: req.params.id });
+    res.json({ ok: true });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Renombrar lista
+app.put("/watch/lists/:id", auth, async (req, res) => {
+  try {
+    const { nombre } = req.body;
+    if (!nombre) return res.status(400).json({ error: "nombre requerido" });
+    const database = await getDb();
+    const lista = await database.collection("watch_lists").findOne({ listId: req.params.id });
+    if (!lista) return res.status(404).json({ error: "Lista no encontrada" });
+    if (lista.creatorUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+    await database.collection("watch_lists").updateOne(
+      { listId: req.params.id },
+      { $set: { nombre, updatedAt: new Date() } }
+    );
+    res.json({ ok: true });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
 // ── Apps (público — sin cambios para Neat Astore) ─────────────────────────────
 app.get("/apps", async (req, res) => {
   const database = await getDb();
