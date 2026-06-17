@@ -42,6 +42,14 @@ function auth(req, res, next) {
   }
 }
 
+function requireScope(scope) {
+  return (req, res, next) => {
+    if (req.user.type !== "oauth") return next();
+    if (req.user.scopes?.includes(scope)) return next();
+    res.status(403).json({ error: `Se requiere scope '${scope}'` });
+  };
+}
+
 // Solo permite admins (role: 'admin')
 function adminAuth(req, res, next) {
   const header = req.headers.authorization;
@@ -174,7 +182,7 @@ async function notifyParticipants(database, chatId, message, senderIdentifier) {
 }
 
 // ── Guardar suscripción push del browser ───────────────────────────────────────
-app.post("/chat/push/subscribe", auth, async (req, res) => {
+app.post("/chat/push/subscribe", auth, requireScope("chatter"), async (req, res) => {
   try {
     const { subscription } = req.body;
     if (!subscription?.endpoint) return res.status(400).json({ error: "Suscripción inválida" });
@@ -204,7 +212,7 @@ app.post("/chat/push/subscribe", auth, async (req, res) => {
 });
 
 // ── Eliminar suscripción push ──────────────────────────────────────────────────
-app.delete("/chat/push/subscribe", auth, async (req, res) => {
+app.delete("/chat/push/subscribe", auth, requireScope("chatter"), async (req, res) => {
   try {
     const { endpoint } = req.body;
     if (!endpoint) return res.status(400).json({ error: "endpoint requerido" });
@@ -437,7 +445,7 @@ app.put("/chat/users/:id/role", adminAuth, async (req, res) => {
 // ── Chats ──────────────────────────────────────────────────────────────────────
 
 // Listar chats del usuario autenticado
-app.get("/chat/chats", auth, async (req, res) => {
+app.get("/chat/chats", auth, requireScope("chatter"), async (req, res) => {
   const database = await getDb();
   const identifier = req.user.username;
 const userId = req.user.userId;
@@ -449,7 +457,7 @@ const chats = await database.collection("chats")
 });
 
 // Crear chat
-app.post("/chat/chats", auth, async (req, res) => {
+app.post("/chat/chats", auth, requireScope("chatter"), async (req, res) => {
   try {
     const { name, type = "direct", participants = [] } = req.body;
 const identifier = req.user.username; // siempre username, nunca ID
@@ -481,7 +489,7 @@ const allParticipants = [...new Set([identifier, ...resolvedParticipants])];
 });
 
 // Obtener chat por ID
-app.get("/chat/chats/:id", auth, async (req, res) => {
+app.get("/chat/chats/:id", auth, requireScope("chatter"), async (req, res) => {
   try {
     const database = await getDb();
     const chat = await database.collection("chats").findOne({ _id: new ObjectId(req.params.id) });
@@ -500,7 +508,7 @@ app.get("/chat/chats/:id", auth, async (req, res) => {
 // ── Mensajes ───────────────────────────────────────────────────────────────────
 
 // Obtener mensajes de un chat (con paginación)
-app.get("/chat/messages/:chatId", auth, async (req, res) => {
+app.get("/chat/messages/:chatId", auth, requireScope("chatter"), async (req, res) => {
   try {
     const database = await getDb();
     const chat = await database.collection("chats").findOne({ _id: new ObjectId(req.params.chatId) });
@@ -527,7 +535,7 @@ if (!chat.participants.includes(identifier) && req.user.role !== "admin")
 });
 
 // Enviar mensaje
-app.post("/chat/messages/:chatId", auth, async (req, res) => {
+app.post("/chat/messages/:chatId", auth, requireScope("chatter"), async (req, res) => {
   try {
     const { content, type = "text", telegramFileId = null, mimeType = null } = req.body;
     if (!content && !telegramFileId)
@@ -568,7 +576,7 @@ res.status(201).json(savedMessage);
 });
 
 // Mensajes nuevos desde timestamp (para polling)
-app.get("/chat/messages/:chatId/since", auth, async (req, res) => {
+app.get("/chat/messages/:chatId/since", auth, requireScope("chatter"), async (req, res) => {
   try {
     const { since } = req.query;
     if (!since) return res.status(400).json({ error: "since requerido" });
