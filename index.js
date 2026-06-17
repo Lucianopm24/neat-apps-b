@@ -1614,6 +1614,8 @@ app.post("/oauth/token", async (req, res) => {
 // Dentro de POST /oauth/token, antes del res.json final, agrega:
 let idToken = null;
 if (oauthCode.scopes.includes("openid")) {
+  const database2 = await getDb();
+  const oidcUser = await database2.collection("users").findOne({ username: oauthCode.username });
   idToken = jwt.sign({
     iss: "https://neat-apps-b.vercel.app",
     sub: oauthCode.username,
@@ -1621,8 +1623,8 @@ if (oauthCode.scopes.includes("openid")) {
     iat: Math.floor(Date.now() / 1000),
     exp: Math.floor(Date.now() / 1000) + 86400,
     username: oauthCode.username,
-    email: scopes.includes("email") ? user?.email : undefined,
-    verified: !!user?.verified,
+    email: scopes.includes("email") ? oidcUser?.email : undefined,
+    verified: !!oidcUser?.verified,
   }, SECRET, { algorithm: "HS256" });
 }
 
