@@ -1670,15 +1670,16 @@ app.get("/oauth/userinfo", auth, async (req, res) => {
     const database = await getDb();
     const isAdmin = req.user.role === "admin";
     
-    if (isAdmin) {
-      return res.json({
-        username: req.user.username,
-        email: `${req.user.username}@${EMAIL_DOMAIN}`,
-        verified: true,
-        role: "admin",
-        neatPlus: true
-      });
-    }
+    const isAdmin = req.user.role === "admin" || req.user.username === ADMIN_USER;
+if (isAdmin) {
+  return res.json({
+    username: req.user.username,
+    email: `${req.user.username}@${EMAIL_DOMAIN}`,
+    verified: true,
+    role: "admin",
+    neatPlus: true
+  });
+}
 
     const user = await database.collection("users")
       .findOne({ username: req.user.username }, { projection: { passwordHash: 0 } });
