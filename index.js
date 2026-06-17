@@ -626,7 +626,7 @@ app.get("/chat/telegram/file/:fileId", auth, async (req, res) => {
 
 // ── Watch — Videos ────────────────────────────────────────────────────────────
 
-app.post("/watch/videos", auth, async (req, res) => {
+app.post("/watch/videos", auth, requireScope("watch"), async (req, res) => {
   try {
     const { title, description, fileId, thumbnailFileId, duration, category } = req.body;
     if (!title || !fileId) return res.status(400).json({ error: "title y fileId requeridos" });
@@ -693,7 +693,7 @@ app.get("/watch/videos/:id", async (req, res) => {
   }
 });
 
-app.put("/watch/videos/:id", auth, async (req, res) => {
+app.put("/watch/videos/:id", auth, requireScope("watch"), async (req, res) => {
   try {
     const database = await getDb();
     const video = await database.collection("watch_videos")
@@ -715,7 +715,7 @@ app.put("/watch/videos/:id", auth, async (req, res) => {
   }
 });
 
-app.delete("/watch/videos/:id", auth, async (req, res) => {
+app.delete("/watch/videos/:id", auth, requireScope("watch"), async (req, res) => {
   try {
     const database = await getDb();
     const video = await database.collection("watch_videos")
@@ -736,7 +736,7 @@ app.delete("/watch/videos/:id", auth, async (req, res) => {
 
 // ── Watch — Likes ─────────────────────────────────────────────────────────────
 
-app.post("/watch/videos/:id/like", auth, async (req, res) => {
+app.post("/watch/videos/:id/like", auth, requireScope("watch"), async (req, res) => {
   try {
     const identifier = req.user.userId || req.user.username;
     const database = await getDb();
@@ -757,7 +757,7 @@ app.post("/watch/videos/:id/like", auth, async (req, res) => {
 
 // ── Watch — Comentarios ───────────────────────────────────────────────────────
 
-app.post("/watch/videos/:id/comments", auth, async (req, res) => {
+app.post("/watch/videos/:id/comments", auth, requireScope("watch"), async (req, res) => {
   try {
     const { content } = req.body;
     if (!content) return res.status(400).json({ error: "content requerido" });
@@ -817,7 +817,7 @@ app.delete("/watch/comments/:id", auth, async (req, res) => {
 
 // ── Watch — Canales / Suscripciones ──────────────────────────────────────────
 
-app.post("/watch/channels/:userId/subscribe", auth, async (req, res) => {
+app.post("/watch/channels/:userId/subscribe", auth, requireScope("watch"), async (req, res) => {
   try {
     const identifier = req.user.userId || req.user.username;
     if (identifier === req.params.userId)
@@ -2133,7 +2133,7 @@ app.delete("/ruletas/:id", auth, async (req, res) => {
 });
 
 // Watch — Historial de vistos (Plus)
-app.post("/watch/history", auth, async (req, res) => {
+app.post("/watch/history", auth, requireScope("watch"), async (req, res) => {
   try {
     const { videoId } = req.body;
     if (!videoId) return res.status(400).json({ error: "videoId requerido" });
@@ -2156,7 +2156,7 @@ app.post("/watch/history", auth, async (req, res) => {
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
 
-app.get("/watch/history", auth, async (req, res) => {
+app.get("/watch/history", auth, requireScope("watch"), async (req, res) => {
   try {
     const database = await getDb();
     const user = req.user.role === "admin" ? null :
@@ -2183,7 +2183,7 @@ function randomListId(len = 8) {
 }
 
 // Crear lista
-app.post("/watch/lists", auth, async (req, res) => {
+app.post("/watch/lists", auth, requireScope("watch"), async (req, res) => {
   try {
     const { nombre } = req.body;
     if (!nombre) return res.status(400).json({ error: "nombre requerido" });
@@ -2219,7 +2219,7 @@ app.get("/watch/lists/:id", async (req, res) => {
 });
 
 // Mis listas
-app.get("/watch/lists/me/list", auth, async (req, res) => {
+app.get("/watch/lists/me/list", auth, requireScope("watch"), async (req, res) => {
   try {
     const database = await getDb();
     const listas = await database.collection("watch_lists")
@@ -2230,7 +2230,7 @@ app.get("/watch/lists/me/list", auth, async (req, res) => {
 });
 
 // Añadir video a lista
-app.post("/watch/lists/:id/videos", auth, async (req, res) => {
+app.post("/watch/lists/:id/videos", auth, requireScope("watch"), async (req, res) => {
   try {
     const { videoId } = req.body;
     if (!videoId) return res.status(400).json({ error: "videoId requerido" });
@@ -2250,7 +2250,7 @@ app.post("/watch/lists/:id/videos", auth, async (req, res) => {
 });
 
 // Quitar video de lista
-app.delete("/watch/lists/:id/videos/:videoId", auth, async (req, res) => {
+app.delete("/watch/lists/:id/videos/:videoId", auth, requireScope("watch"), async (req, res) => {
   try {
     const database = await getDb();
     const lista = await database.collection("watch_lists").findOne({ listId: req.params.id });
@@ -2266,7 +2266,7 @@ app.delete("/watch/lists/:id/videos/:videoId", auth, async (req, res) => {
 });
 
 // Eliminar lista
-app.delete("/watch/lists/:id", auth, async (req, res) => {
+app.delete("/watch/lists/:id", auth, requireScope("watch"), async (req, res) => {
   try {
     const database = await getDb();
     const lista = await database.collection("watch_lists").findOne({ listId: req.params.id });
@@ -2279,7 +2279,7 @@ app.delete("/watch/lists/:id", auth, async (req, res) => {
 });
 
 // Renombrar lista
-app.put("/watch/lists/:id", auth, async (req, res) => {
+app.put("/watch/lists/:id", auth, requireScope("watch"), async (req, res) => {
   try {
     const { nombre } = req.body;
     if (!nombre) return res.status(400).json({ error: "nombre requerido" });
