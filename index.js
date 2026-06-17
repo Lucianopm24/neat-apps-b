@@ -1472,18 +1472,41 @@ app.put("/u/:username/web", auth, async (req, res) => {
 const crypto = require("crypto");
 
 // Registrar cliente OAuth (solo admin)
-app.post("/oauth/clients", adminAuth, async (req, res) => {
+app.post("/oauth/clients", auth, async (req, res) => {
   try {
     const { name, redirectUris, scopes } = req.body;
     if (!name || !redirectUris?.length) return res.status(400).json({ error: "name y redirectUris requeridos" });
 
     const database = await getDb();
+    const isAdmin = req.user.role === "admin";
+
+    if (!isAdmin) {
+      const user = await database.collection("users").findOne({ username: req.user.username });
+      const hasPlus = !!user?.neatPlus;
+      const myClients = await database.collection("oauth_clients")
+        .countDocuments({ ownerUsername: req.user.username });
+
+      if (!hasPlus && myClients >= 3) {
+        // Cobrar 75 NP por app extra
+        if ((user?.neatPoints || 0) < 75)
+          return res.status(403).json({ error: "Límite de 3 apps alcanzado. Necesitas 75 NP para una app extra o Neat Plus para ilimitadas." });
+        await database.collection("users").updateOne(
+          { username: req.user.username }, { $inc: { neatPoints: -75 } }
+        );
+        await database.collection("np_history").insertOne({
+          from: req.user.username, to: "Neat", amount: 75,
+          type: "oauth_app_slot", createdAt: new Date()
+        });
+      }
+    }
+
     const client = {
       name,
       clientId: crypto.randomBytes(16).toString("hex"),
       clientSecret: crypto.randomBytes(32).toString("hex"),
       redirectUris,
       scopes: scopes || ["profile"],
+      ownerUsername: isAdmin ? null : req.user.username,
       createdAt: new Date()
     };
     await database.collection("oauth_clients").insertOne(client);
@@ -1497,6 +1520,32 @@ app.get("/oauth/clients", adminAuth, async (req, res) => {
     const database = await getDb();
     const clients = await database.collection("oauth_clients")
       .find({}, { projection: { clientSecret: 0 } }).toArray();
+    res.json(clients);
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+app.get("/oauth/clients/:clientId/secret", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const client = await database.collection("oauth_clients")
+      .findOne({ clientId: req.params.clientId });
+    if (!client) return res.status(404).json({ error: "Cliente no encontrado" });
+    const isAdmin = req.user.role === "admin";
+    if (!isAdmin && client.ownerUsername !== req.user.username)
+      return res.status(403).json({ error: "Sin permisos" });
+    res.json({ clientSecret: client.clientSecret });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+app.get("/oauth/clients/me/list", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const filter = req.user.role === "admin"
+      ? {}
+      : { ownerUsername: req.user.username };
+    const clients = await database.collection("oauth_clients")
+      .find(filter, { projection: { clientSecret: 0 } })
+      .sort({ createdAt: -1 }).toArray();
     res.json(clients);
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
