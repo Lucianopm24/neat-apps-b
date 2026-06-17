@@ -8,6 +8,7 @@ const webpush = require("web-push");
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 app.use(cors());
 
 const SECRET = process.env.JWT_SECRET || "changeme";
@@ -1597,10 +1598,13 @@ if (userCheck?.suspended) return res.status(403).json({
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
 
-// Token exchange — code → token
 app.post("/oauth/token", async (req, res) => {
   try {
-    const { code, clientId, clientSecret, redirectUri } = req.body;
+    // Soporta JSON (clientId/clientSecret) y form-urlencoded estándar OAuth2 (client_id/client_secret)
+    const code = req.body.code;
+    const clientId = req.body.clientId || req.body.client_id;
+    const clientSecret = req.body.clientSecret || req.body.client_secret;
+    const redirectUri = req.body.redirectUri || req.body.redirect_uri;
     if (!code || !clientId || !clientSecret)
       return res.status(400).json({ error: "Faltan campos" });
 
