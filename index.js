@@ -1668,7 +1668,6 @@ app.get("/oauth/tokens", auth, async (req, res) => {
 app.get("/oauth/userinfo", auth, async (req, res) => {
   try {
     const database = await getDb();
-    const isAdmin = req.user.role === "admin";
     
     const isAdmin = req.user.role === "admin" || req.user.username === ADMIN_USER;
 if (isAdmin) {
