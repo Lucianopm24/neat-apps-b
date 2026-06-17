@@ -1935,6 +1935,162 @@ app.get("/notes", async (req, res) => {
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
 
+// ── Neat Ruletas ────────────────────────────────────────────────────────────────
+
+function randomRuletaId(len = 8) {
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  return Array.from(crypto.randomBytes(len))
+    .map(b => chars[b % chars.length]).join('');
+}
+
+// Crear ruleta
+app.post("/ruletas", auth, async (req, res) => {
+  try {
+    const { nombre, opciones, colores } = req.body;
+    if (!opciones || opciones.length < 2) return res.status(400).json({ error: "Mínimo 2 opciones" });
+
+    const database = await getDb();
+    const user = req.user.role === "admin" ? null :
+      await database.collection("users").findOne({ username: req.user.username });
+    const hasPlus = req.user.role === "admin" || !!user?.neatPlus;
+
+    // Colores personalizados solo Plus
+    if (colores && !hasPlus)
+      return res.status(403).json({ error: "Necesitas Neat Plus para colores personalizados" });
+
+    const ruletaId = randomRuletaId();
+    const ruleta = {
+      ruletaId,
+      nombre: nombre || "Mi ruleta",
+      opciones,
+      colores: hasPlus && colores ? colores : null,
+      autorUsername: req.user.username,
+      historial: [],
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    await database.collection("ruletas").insertOne(ruleta);
+    res.status(201).json({ ruletaId, nombre: ruleta.nombre });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// Ver ruleta por ID
+app.get("/ruletas/:id", async (req, res) => {
+  try {
+    const database = await getDb();
+    const ruleta = await database.collection("ruletas").findOne({ ruletaId: req.params.id });
+    if (!ruleta) return res.status(404).json({ error: "Ruleta no encontrada" });
+
+    const isAdmin = ruleta.autorUsername === process.env.ADMIN_USER;
+    let verified = false;
+    if (isAdmin) {
+      verified = true;
+    } else {
+      const autor = await database.collection("users")
+        .findOne({ username: ruleta.autorUsername }, { projection: { verified: 1 } });
+      verified = !!autor?.verified;
+    }
+
+    res.json({ ...ruleta, autorVerified: verified });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Mis ruletas
+app.get("/ruletas/me/list", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const ruletas = await database.collection("ruletas")
+      .find({ autorUsername: req.user.username }, { projection: { historial: 0 } })
+      .sort({ updatedAt: -1 }).toArray();
+    res.json(ruletas);
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Girar ruleta (registra resultado)
+app.post("/ruletas/:id/girar", auth, async (req, res) => {
+  try {
+    const { resultado } = req.body;
+    if (!resultado) return res.status(400).json({ error: "resultado requerido" });
+
+    const database = await getDb();
+    const ruleta = await database.collection("ruletas").findOne({ ruletaId: req.params.id });
+    if (!ruleta) return res.status(404).json({ error: "Ruleta no encontrada" });
+    if (ruleta.autorUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+
+    const entrada = { resultado, fecha: new Date() };
+    const nuevoHistorial = [entrada, ...(ruleta.historial || [])].slice(0, 50);
+
+    await database.collection("ruletas").updateOne(
+      { ruletaId: req.params.id },
+      { $set: { historial: nuevoHistorial, updatedAt: new Date() } }
+    );
+    res.json({ ok: true, resultado });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Ver historial (solo Plus)
+app.get("/ruletas/:id/historial", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const ruleta = await database.collection("ruletas").findOne({ ruletaId: req.params.id });
+    if (!ruleta) return res.status(404).json({ error: "Ruleta no encontrada" });
+    if (ruleta.autorUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+
+    const user = req.user.role === "admin" ? null :
+      await database.collection("users").findOne({ username: req.user.username });
+    const hasPlus = req.user.role === "admin" || !!user?.neatPlus;
+    if (!hasPlus) return res.status(403).json({ error: "Necesitas Neat Plus para ver el historial" });
+
+    res.json(ruleta.historial || []);
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Editar ruleta
+app.put("/ruletas/:id", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const ruleta = await database.collection("ruletas").findOne({ ruletaId: req.params.id });
+    if (!ruleta) return res.status(404).json({ error: "Ruleta no encontrada" });
+    if (ruleta.autorUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+
+    const { nombre, opciones, colores } = req.body;
+    const user = req.user.role === "admin" ? null :
+      await database.collection("users").findOne({ username: req.user.username });
+    const hasPlus = req.user.role === "admin" || !!user?.neatPlus;
+
+    if (colores && !hasPlus)
+      return res.status(403).json({ error: "Necesitas Neat Plus para colores personalizados" });
+
+    const update = { updatedAt: new Date() };
+    if (nombre) update.nombre = nombre;
+    if (opciones && opciones.length >= 2) update.opciones = opciones;
+    if (colores !== undefined) update.colores = hasPlus && colores ? colores : null;
+
+    await database.collection("ruletas").updateOne({ ruletaId: req.params.id }, { $set: update });
+    res.json({ ok: true });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Eliminar ruleta
+app.delete("/ruletas/:id", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const ruleta = await database.collection("ruletas").findOne({ ruletaId: req.params.id });
+    if (!ruleta) return res.status(404).json({ error: "Ruleta no encontrada" });
+    if (ruleta.autorUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+    await database.collection("ruletas").deleteOne({ ruletaId: req.params.id });
+    res.json({ ok: true });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
 // ── Apps (público — sin cambios para Neat Astore) ─────────────────────────────
 app.get("/apps", async (req, res) => {
   const database = await getDb();
