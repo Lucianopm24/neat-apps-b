@@ -2390,6 +2390,26 @@ app.delete("/oauth/clients/:clientId", auth, async (req, res) => {
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
 
+app.put("/oauth/clients/:clientId", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const client = await database.collection("oauth_clients").findOne({ clientId: req.params.clientId });
+    if (!client) return res.status(404).json({ error: "No encontrada" });
+    const isAdmin = req.user.role === "admin";
+    if (!isAdmin && client.ownerUsername !== req.user.username)
+      return res.status(403).json({ error: "Sin permisos" });
+
+    const { name, redirectUris, scopes } = req.body;
+    if (!name || !redirectUris?.length) return res.status(400).json({ error: "name y redirectUris requeridos" });
+
+    await database.collection("oauth_clients").updateOne(
+      { clientId: req.params.clientId },
+      { $set: { name, redirectUris, scopes: scopes || ["profile"] } }
+    );
+    res.json({ ok: true });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
 // ── Apps (público — sin cambios para Neat Astore) ─────────────────────────────
 app.get("/apps", async (req, res) => {
   const database = await getDb();
