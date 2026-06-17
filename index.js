@@ -2091,6 +2091,48 @@ app.delete("/ruletas/:id", auth, async (req, res) => {
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
 
+// Watch — Historial de vistos (Plus)
+app.post("/watch/history", auth, async (req, res) => {
+  try {
+    const { videoId } = req.body;
+    if (!videoId) return res.status(400).json({ error: "videoId requerido" });
+    const database = await getDb();
+    const user = req.user.role === "admin" ? null :
+      await database.collection("users").findOne({ username: req.user.username });
+    const hasPlus = req.user.role === "admin" || !!user?.neatPlus;
+    if (!hasPlus) return res.json({ ok: true }); // silencioso para no-Plus
+    const entry = { videoId, viewedAt: new Date() };
+    await database.collection("watch_history").updateOne(
+      { username: req.user.username },
+      { $pull: { history: { videoId } } }
+    );
+    await database.collection("watch_history").updateOne(
+      { username: req.user.username },
+      { $push: { history: { $each: [entry], $position: 0, $slice: 25 } }, $setOnInsert: { username: req.user.username } },
+      { upsert: true }
+    );
+    res.json({ ok: true });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+app.get("/watch/history", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const user = req.user.role === "admin" ? null :
+      await database.collection("users").findOne({ username: req.user.username });
+    const hasPlus = req.user.role === "admin" || !!user?.neatPlus;
+    if (!hasPlus) return res.status(403).json({ error: "Necesitas Neat Plus" });
+    const doc = await database.collection("watch_history").findOne({ username: req.user.username });
+    if (!doc?.history?.length) return res.json([]);
+    const videoIds = doc.history.map(h => new ObjectId(h.videoId));
+    const videos = await database.collection("watch_videos")
+      .find({ _id: { $in: videoIds } }).toArray();
+    const videoMap = {};
+    videos.forEach(v => videoMap[v._id.toString()] = v);
+    res.json(doc.history.map(h => ({ ...videoMap[h.videoId], viewedAt: h.viewedAt })).filter(v => v._id));
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
 // ── Apps (público — sin cambios para Neat Astore) ─────────────────────────────
 app.get("/apps", async (req, res) => {
   const database = await getDb();
