@@ -1349,7 +1349,7 @@ app.get("/u/:username", async (req, res) => {
       customCategories: profile.customCategories || [],
       autoLinks,
       hasCustomWeb: !!profile.customWeb,
-      profileViews: profile.profileViews || 0
+      profileViews: profile.neatPlus ? (profile.profileViews || 0) : undefined
     });
   } catch (err) {
     res.status(500).json({ error: "Error interno" });
