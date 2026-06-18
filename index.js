@@ -2945,6 +2945,25 @@ app.post("/watch/upload/archive", auth, requireScope("watch"), upload.single("fi
   }
 });
 
+// ── Watch — Stream de video vía Telegram ─────────────────────────────────────
+app.get("/watch/stream/:fileId", auth, requireScope("watch"), async (req, res) => {
+  try {
+    if (!TELEGRAM_BOT_TOKEN)
+      return res.status(503).json({ error: "TELEGRAM_BOT_TOKEN no configurado" });
+
+    const response = await fetch(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${req.params.fileId}`
+    );
+    const data = await response.json();
+    if (!data.ok) return res.status(404).json({ error: "Archivo no encontrado" });
+
+    const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${data.result.file_path}`;
+    res.redirect(302, fileUrl);
+  } catch (err) {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
 // ── Apps (público — sin cambios para Neat Astore) ─────────────────────────────
 app.get("/apps", async (req, res) => {
   const database = await getDb();
