@@ -2410,6 +2410,24 @@ app.put("/oauth/clients/:clientId", auth, async (req, res) => {
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
 
+app.put("/oauth/clients/:clientId/verify", adminAuth, async (req, res) => {
+  try {
+    const { verified } = req.body;
+    const database = await getDb();
+    const client = await database.collection("oauth_clients").findOne({ clientId: req.params.clientId });
+    if (!client) return res.status(404).json({ error: "Cliente no encontrado" });
+
+    await database.collection("oauth_clients").updateOne(
+      { clientId: req.params.clientId },
+      { $set: {
+        verified: !!verified,
+        verifiedAt: verified ? new Date() : null
+      }}
+    );
+    res.json({ ok: true, verified: !!verified });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
 // ── Apps (público — sin cambios para Neat Astore) ─────────────────────────────
 app.get("/apps", async (req, res) => {
   const database = await getDb();
