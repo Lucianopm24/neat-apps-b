@@ -1565,7 +1565,7 @@ app.get("/oauth/clients/:clientId", async (req, res) => {
 // Autorizar — el usuario aprueba, se genera el code
 app.post("/oauth/authorize", auth, async (req, res) => {
   try {
-    const { clientId, redirectUri, scopes } = req.body;
+    const { clientId, redirectUri, scopes, codeChallenge, codeChallengeMethod } = req.body;
     const database = await getDb();
 
     const client = await database.collection("oauth_clients").findOne({ clientId });
@@ -1580,7 +1580,7 @@ if (userCheck?.suspended) return res.status(403).json({
       return res.status(400).json({ error: "redirect_uri no autorizada" });
 
     // Validar scopes pedidos
-    const validScopes = ["openid", "profile", "email", "points", "chatter", "watch", "forums", "account"];
+    const validScopes = ["openid", "profile", "email", "points", "chatter", "watch", "forums", "forms", "account"];
     const requestedScopes = (scopes || ["profile"]).filter(s => validScopes.includes(s));
 
     const code = crypto.randomBytes(32).toString("hex");
@@ -1590,6 +1590,8 @@ if (userCheck?.suspended) return res.status(403).json({
       username: req.user.username,
       redirectUri,
       scopes: requestedScopes,
+      codeChallenge: codeChallenge || null,
+      codeChallengeMethod: codeChallengeMethod || "S256",
       expiresAt: new Date(Date.now() + 5 * 60 * 1000), // 5 minutos
       used: false
     });
@@ -1605,19 +1607,32 @@ app.post("/oauth/token", async (req, res) => {
     const clientId = req.body.clientId || req.body.client_id;
     const clientSecret = req.body.clientSecret || req.body.client_secret;
     const redirectUri = req.body.redirectUri || req.body.redirect_uri;
-    if (!code || !clientId || !clientSecret)
+    const codeVerifier = req.body.codeVerifier || req.body.code_verifier;
+    if (!code || !clientId)
       return res.status(400).json({ error: "Faltan campos" });
 
     const database = await getDb();
-
-    const client = await database.collection("oauth_clients").findOne({ clientId, clientSecret });
-    if (!client) return res.status(401).json({ error: "Credenciales de cliente inválidas" });
 
     const oauthCode = await database.collection("oauth_codes").findOne({ code, clientId });
     if (!oauthCode) return res.status(400).json({ error: "Código inválido" });
     if (oauthCode.used) return res.status(400).json({ error: "Código ya usado" });
     if (new Date() > oauthCode.expiresAt) return res.status(400).json({ error: "Código expirado" });
     if (oauthCode.redirectUri !== redirectUri) return res.status(400).json({ error: "redirect_uri no coincide" });
+
+    const client = await database.collection("oauth_clients").findOne({ clientId });
+    if (!client) return res.status(401).json({ error: "Cliente no encontrado" });
+
+    if (oauthCode.codeChallenge) {
+      // Flujo PKCE — no requiere client_secret, se valida el code_verifier
+      if (!codeVerifier) return res.status(400).json({ error: "code_verifier requerido" });
+      const hash = crypto.createHash("sha256").update(codeVerifier).digest("base64url");
+      if (hash !== oauthCode.codeChallenge)
+        return res.status(401).json({ error: "code_verifier inválido" });
+    } else {
+      // Flujo clásico — requiere client_secret
+      if (!clientSecret || client.clientSecret !== clientSecret)
+        return res.status(401).json({ error: "Credenciales de cliente inválidas" });
+    }
 
     // Marcar código como usado
     await database.collection("oauth_codes").updateOne({ code }, { $set: { used: true } });
@@ -2425,6 +2440,380 @@ app.put("/oauth/clients/:clientId/verify", adminAuth, async (req, res) => {
       }}
     );
     res.json({ ok: true, verified: !!verified });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// ── Neat Forms ──────────────────────────────────────────────────────────────
+
+function randomPollId(len = 8) {
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  return Array.from(crypto.randomBytes(len))
+    .map(b => chars[b % chars.length]).join('');
+}
+
+const FORMS_QUESTION_TYPES = [
+  "multiple_choice", "checkboxes", "datetime", "text",
+  "paragraph", "linear_scale", "grid", "file_upload"
+];
+
+// Crear poll — requiere scope 'forms'
+app.post("/forms/polls", auth, requireScope("forms"), async (req, res) => {
+  try {
+    const {
+      title, description, questionType, options,
+      accessMode = "public", anonymous = false,
+      allowMultipleVotes = false, expiresAt,
+      scaleMin, scaleMax, scaleMinLabel, scaleMaxLabel,
+      gridRows, gridColumns
+    } = req.body;
+
+    if (!title) return res.status(400).json({ error: "title requerido" });
+    if (!FORMS_QUESTION_TYPES.includes(questionType))
+      return res.status(400).json({ error: "questionType inválido" });
+
+    if (["multiple_choice", "checkboxes", "datetime"].includes(questionType) && (!options || options.length < 2))
+      return res.status(400).json({ error: "Mínimo 2 opciones" });
+
+    if (questionType === "linear_scale") {
+      if (typeof scaleMin !== "number" || typeof scaleMax !== "number" || scaleMin >= scaleMax)
+        return res.status(400).json({ error: "scaleMin y scaleMax inválidos" });
+      if (scaleMax - scaleMin > 10) return res.status(400).json({ error: "Rango máximo de 10" });
+    }
+
+    if (questionType === "grid") {
+      if (!gridRows?.length || !gridColumns?.length)
+        return res.status(400).json({ error: "gridRows y gridColumns requeridos" });
+    }
+
+    const database = await getDb();
+    let pollId = randomPollId();
+    while (await database.collection("forms_polls").findOne({ pollId })) pollId = randomPollId();
+
+    const poll = {
+      pollId,
+      title,
+      description: description || "",
+      questionType,
+      options: ["multiple_choice", "checkboxes", "datetime"].includes(questionType) ? options : [],
+      scaleMin: questionType === "linear_scale" ? scaleMin : null,
+      scaleMax: questionType === "linear_scale" ? scaleMax : null,
+      scaleMinLabel: questionType === "linear_scale" ? (scaleMinLabel || null) : null,
+      scaleMaxLabel: questionType === "linear_scale" ? (scaleMaxLabel || null) : null,
+      gridRows: questionType === "grid" ? gridRows : null,
+      gridColumns: questionType === "grid" ? gridColumns : null,
+      accessMode: ["public", "neat_only"].includes(accessMode) ? accessMode : "public",
+      anonymous: !!anonymous,
+      allowMultipleVotes: !!allowMultipleVotes,
+      expiresAt: expiresAt ? new Date(expiresAt) : null,
+      creatorUsername: req.user.username,
+      closed: false,
+      createdAt: new Date()
+    };
+
+    await database.collection("forms_polls").insertOne(poll);
+    res.status(201).json(poll);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// Ver poll por ID — público, sin auth (necesario para votantes sin cuenta)
+app.get("/forms/polls/:id", async (req, res) => {
+  try {
+    const database = await getDb();
+    const poll = await database.collection("forms_polls").findOne({ pollId: req.params.id });
+    if (!poll) return res.status(404).json({ error: "Poll no encontrada" });
+
+    const expired = poll.expiresAt && new Date() > new Date(poll.expiresAt);
+
+    const isAdmin = poll.creatorUsername === process.env.ADMIN_USER;
+    let verified = isAdmin;
+    if (!isAdmin) {
+      const author = await database.collection("users")
+        .findOne({ username: poll.creatorUsername }, { projection: { verified: 1 } });
+      verified = !!author?.verified;
+    }
+
+    res.json({ ...poll, expired, creatorVerified: verified });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Resultados — público, sin auth obligatorio (el creador se identifica vía header opcional)
+app.get("/forms/polls/:id/results", async (req, res) => {
+  try {
+    const database = await getDb();
+    const poll = await database.collection("forms_polls").findOne({ pollId: req.params.id });
+    if (!poll) return res.status(404).json({ error: "Poll no encontrada" });
+
+    const votes = await database.collection("forms_votes")
+      .find({ pollId: req.params.id }).toArray();
+
+    const isCreator = req.headers.authorization &&
+      (() => { try { return jwt.verify(req.headers.authorization.replace("Bearer ", ""), SECRET).username === poll.creatorUsername; } catch { return false; } })();
+
+    if (["text", "paragraph", "file_upload"].includes(poll.questionType)) {
+      return res.json({
+        totalResponses: votes.length,
+        responses: isCreator
+          ? votes.map(v => ({
+              value: v.selections[0],
+              voter: poll.anonymous ? null : (v.voterUsername || v.voterName)
+            }))
+          : null
+      });
+    }
+
+    if (poll.questionType === "linear_scale") {
+      const counts = {};
+      for (let i = poll.scaleMin; i <= poll.scaleMax; i++) counts[i] = 0;
+      votes.forEach(v => { if (counts[v.selections[0]] !== undefined) counts[v.selections[0]]++; });
+      const avg = votes.length ? votes.reduce((s, v) => s + Number(v.selections[0]), 0) / votes.length : 0;
+      return res.json({ totalVotes: votes.length, counts, average: avg });
+    }
+
+    if (poll.questionType === "grid") {
+      const grid = {};
+      poll.gridRows.forEach(row => {
+        grid[row] = {};
+        poll.gridColumns.forEach(col => grid[row][col] = 0);
+      });
+      votes.forEach(v => {
+        (v.selections || []).forEach(sel => {
+          if (grid[sel.row] && grid[sel.row][sel.column] !== undefined) grid[sel.row][sel.column]++;
+        });
+      });
+      return res.json({ totalVotes: votes.length, grid });
+    }
+
+    // multiple_choice, checkboxes, datetime
+    const counts = poll.options.map((opt, i) => ({
+      option: opt,
+      count: votes.filter(v => v.selections.includes(i)).length,
+      voters: poll.anonymous ? null : votes.filter(v => v.selections.includes(i)).map(v => v.voterUsername || v.voterName)
+    }));
+
+    res.json({ totalVotes: votes.length, counts });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Votar — público, sin auth obligatorio salvo accessMode === "neat_only"
+app.post("/forms/polls/:id/vote", async (req, res) => {
+  try {
+    const database = await getDb();
+    const poll = await database.collection("forms_polls").findOne({ pollId: req.params.id });
+    if (!poll) return res.status(404).json({ error: "Poll no encontrada" });
+    if (poll.closed) return res.status(403).json({ error: "Poll cerrada" });
+    if (poll.expiresAt && new Date() > new Date(poll.expiresAt))
+      return res.status(403).json({ error: "Poll expirada" });
+
+    const { selections, text, gridSelections, scaleValue, fileId, voterName, voterToken } = req.body;
+
+    let voterUsername = null;
+    let resolvedVoterName = null;
+    let resolvedToken = voterToken;
+
+    if (poll.accessMode === "neat_only") {
+      const header = req.headers.authorization;
+      if (!header) return res.status(401).json({ error: "Esta poll requiere cuenta de Neat" });
+      let payload;
+      try {
+        payload = jwt.verify(header.replace("Bearer ", ""), SECRET);
+      } catch { return res.status(401).json({ error: "Token inválido" }); }
+
+      // Si es token OAuth, exigir scope 'forms'
+      if (payload.type === "oauth" && !payload.scopes?.includes("forms"))
+        return res.status(403).json({ error: "Se requiere scope 'forms'" });
+
+      voterUsername = payload.username;
+
+      const already = await database.collection("forms_votes")
+        .findOne({ pollId: req.params.id, voterUsername });
+      if (already) return res.status(409).json({ error: "Ya votaste en esta poll" });
+    } else {
+      if (!voterName) return res.status(400).json({ error: "voterName requerido" });
+      resolvedVoterName = String(voterName).slice(0, 40);
+      resolvedToken = voterToken || crypto.randomBytes(12).toString("hex");
+
+      if (voterToken) {
+        const already = await database.collection("forms_votes")
+          .findOne({ pollId: req.params.id, voterToken });
+        if (already) return res.status(409).json({ error: "Ya votaste en esta poll" });
+      }
+    }
+
+    let resolvedSelections;
+
+    if (["text", "paragraph"].includes(poll.questionType)) {
+      if (!text) return res.status(400).json({ error: "text requerido" });
+      resolvedSelections = [String(text).slice(0, poll.questionType === "paragraph" ? 5000 : 500)];
+
+    } else if (poll.questionType === "file_upload") {
+      if (!fileId) return res.status(400).json({ error: "fileId requerido (sube primero con /forms/polls/:id/upload)" });
+      resolvedSelections = [fileId];
+
+    } else if (poll.questionType === "linear_scale") {
+      if (typeof scaleValue !== "number" || scaleValue < poll.scaleMin || scaleValue > poll.scaleMax)
+        return res.status(400).json({ error: "scaleValue fuera de rango" });
+      resolvedSelections = [scaleValue];
+
+    } else if (poll.questionType === "grid") {
+      if (!Array.isArray(gridSelections) || !gridSelections.length)
+        return res.status(400).json({ error: "gridSelections requerido" });
+      const valid = gridSelections.every(s => poll.gridRows.includes(s.row) && poll.gridColumns.includes(s.column));
+      if (!valid) return res.status(400).json({ error: "Selección de grid inválida" });
+      resolvedSelections = gridSelections;
+
+    } else {
+      // multiple_choice, checkboxes, datetime
+      if (!Array.isArray(selections) || !selections.length)
+        return res.status(400).json({ error: "selections requerido" });
+      if (poll.questionType === "multiple_choice" && selections.length > 1)
+        return res.status(400).json({ error: "Esta poll solo permite una opción" });
+      resolvedSelections = selections.filter(i => i >= 0 && i < poll.options.length);
+    }
+
+    await database.collection("forms_votes").insertOne({
+      pollId: req.params.id,
+      voterUsername,
+      voterName: resolvedVoterName,
+      voterToken: poll.accessMode === "public" ? resolvedToken : null,
+      selections: resolvedSelections,
+      createdAt: new Date()
+    });
+
+    res.status(201).json({ ok: true, voterToken: poll.accessMode === "public" ? resolvedToken : undefined });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// Subir archivo para pregunta tipo file_upload — público, sin auth obligatorio
+app.post("/forms/polls/:id/upload", upload.single("file"), async (req, res) => {
+  try {
+    if (!TELEGRAM_BOT_TOKEN) return res.status(503).json({ error: "TELEGRAM_BOT_TOKEN no configurado" });
+    if (!req.file) return res.status(400).json({ error: "Archivo requerido" });
+
+    const database = await getDb();
+    const poll = await database.collection("forms_polls").findOne({ pollId: req.params.id });
+    if (!poll) return res.status(404).json({ error: "Poll no encontrada" });
+    if (poll.questionType !== "file_upload") return res.status(400).json({ error: "Esta poll no acepta archivos" });
+
+    // Límite: 20MB si el CREADOR es Plus, O si quien responde es Plus. 10MB si ninguno.
+    let creatorHasPlus = false;
+    const creatorIsAdmin = poll.creatorUsername === process.env.ADMIN_USER;
+    if (creatorIsAdmin) {
+      creatorHasPlus = true;
+    } else {
+      const creator = await database.collection("users")
+        .findOne({ username: poll.creatorUsername }, { projection: { neatPlus: 1 } });
+      creatorHasPlus = !!creator?.neatPlus;
+    }
+
+    let responderHasPlus = false;
+    const header = req.headers.authorization;
+    if (header) {
+      try {
+        const payload = jwt.verify(header.replace("Bearer ", ""), SECRET);
+        if (payload.type === "oauth" && !payload.scopes?.includes("forms")) {
+          // Token OAuth sin scope forms — no se usa para chequear plan, se ignora
+        } else if (payload.role === "admin") {
+          responderHasPlus = true;
+        } else {
+          const u = await database.collection("users").findOne({ username: payload.username }, { projection: { neatPlus: 1 } });
+          responderHasPlus = !!u?.neatPlus;
+        }
+      } catch {}
+    }
+
+    const hasPlus = creatorHasPlus || responderHasPlus;
+    const maxSize = hasPlus ? 20 * 1024 * 1024 : 10 * 1024 * 1024;
+    if (req.file.size > maxSize)
+      return res.status(413).json({ error: `Archivo demasiado grande. Máximo ${hasPlus ? 20 : 10}MB` });
+
+    const STORAGE_CHAT_ID = process.env.TELEGRAM_STORAGE_CHAT_ID;
+    if (!STORAGE_CHAT_ID) return res.status(503).json({ error: "TELEGRAM_STORAGE_CHAT_ID no configurado" });
+
+    const form = new FormData();
+    form.append("chat_id", STORAGE_CHAT_ID);
+    form.append("document", req.file.buffer, {
+      filename: req.file.originalname,
+      contentType: req.file.mimetype,
+    });
+
+    const https = require("https");
+    const formBuffer = form.getBuffer();
+    const formHeaders = form.getHeaders();
+
+    const tgResponse = await new Promise((resolve, reject) => {
+      const options = {
+        hostname: "api.telegram.org",
+        path: `/bot${TELEGRAM_BOT_TOKEN}/sendDocument`,
+        method: "POST",
+        headers: { ...formHeaders, "Content-Length": formBuffer.length },
+      };
+      const reqTg = https.request(options, (resTg) => {
+        let data = "";
+        resTg.on("data", chunk => data += chunk);
+        resTg.on("end", () => resolve(data));
+      });
+      reqTg.on("error", reject);
+      reqTg.write(formBuffer);
+      reqTg.end();
+    });
+
+    const tgData = JSON.parse(tgResponse);
+    if (!tgData.ok) return res.status(500).json({ error: "Error subiendo a Telegram" });
+
+    res.json({
+      fileId: tgData.result.document.file_id,
+      fileName: req.file.originalname,
+      fileSize: req.file.size
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// Mis polls — requiere scope 'forms'
+app.get("/forms/polls/me/list", auth, requireScope("forms"), async (req, res) => {
+  try {
+    const database = await getDb();
+    const polls = await database.collection("forms_polls")
+      .find({ creatorUsername: req.user.username })
+      .sort({ createdAt: -1 }).toArray();
+    res.json(polls);
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Cerrar poll — requiere scope 'forms'
+app.put("/forms/polls/:id/close", auth, requireScope("forms"), async (req, res) => {
+  try {
+    const database = await getDb();
+    const poll = await database.collection("forms_polls").findOne({ pollId: req.params.id });
+    if (!poll) return res.status(404).json({ error: "Poll no encontrada" });
+    if (poll.creatorUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+    await database.collection("forms_polls").updateOne(
+      { pollId: req.params.id }, { $set: { closed: true } }
+    );
+    res.json({ ok: true });
+  } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Eliminar poll — requiere scope 'forms'
+app.delete("/forms/polls/:id", auth, requireScope("forms"), async (req, res) => {
+  try {
+    const database = await getDb();
+    const poll = await database.collection("forms_polls").findOne({ pollId: req.params.id });
+    if (!poll) return res.status(404).json({ error: "Poll no encontrada" });
+    if (poll.creatorUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+    await database.collection("forms_polls").deleteOne({ pollId: req.params.id });
+    await database.collection("forms_votes").deleteMany({ pollId: req.params.id });
+    res.json({ ok: true });
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
 
