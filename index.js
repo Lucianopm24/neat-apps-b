@@ -629,19 +629,19 @@ app.get("/chat/telegram/file/:fileId", auth, async (req, res) => {
 
 app.post("/watch/videos", auth, requireScope("watch"), async (req, res) => {
   try {
-    const { title, description, fileId, thumbnailFileId, duration, category } = req.body;
-    if (!title || !fileId) return res.status(400).json({ error: "title y fileId requeridos" });
+    const { title, description, fileId, rawUrl, thumbnailFileId, duration, category } = req.body;
+    if (!title || (!fileId && !rawUrl)) return res.status(400).json({ error: "title y fileId o rawUrl requeridos" });
 
     const identifier = req.user.userId || req.user.username;
     const database = await getDb();
     const result = await database.collection("watch_videos").insertOne({
-      title, description, fileId, thumbnailFileId: thumbnailFileId || null,
+      title, description, fileId: fileId || null, rawUrl: rawUrl || null, thumbnailFileId: thumbnailFileId || null,
       duration: duration || null, category: category || null,
       uploadedBy: identifier, uploaderUsername: req.user.username,
 uploaderVerified: false,
       likes: [], views: 0, createdAt: new Date()
     });
-    res.status(201).json({ _id: result.insertedId, title, fileId });
+    res.status(201).json({ _id: result.insertedId, title, fileId, rawUrl });
   } catch (err) {
     res.status(500).json({ error: "Error interno" });
   }
