@@ -627,21 +627,56 @@ app.get("/chat/telegram/file/:fileId", auth, async (req, res) => {
 
 // ── Watch — Videos ────────────────────────────────────────────────────────────
 
+// El Worker de Cloudflare llama esto ANTES de aceptar una subida — confirma que el
+// JWT es válido (gracias al middleware `auth`) y le dice al Worker si el usuario
+// es Plus o no, para que decida Telegram vs Filebrowser. neatPlus nunca viaja en
+// el JWT (se consulta siempre en Mongo), así que no se puede confiar en el token solo.
+app.get("/watch/upload-auth", auth, requireScope("watch"), async (req, res) => {
+  try {
+    if (req.user.role === "admin") {
+      return res.json({ ok: true, username: req.user.username, neatPlus: true });
+    }
+    const database = await getDb();
+    const user = await database.collection("users").findOne(
+      { username: req.user.username },
+      { projection: { neatPlus: 1, neatPlusExpiresAt: 1 } }
+    );
+    const expired = user?.neatPlusExpiresAt && new Date() > new Date(user.neatPlusExpiresAt);
+    if (expired) {
+      await database.collection("users").updateOne(
+        { username: req.user.username }, { $set: { neatPlus: false } }
+      );
+    }
+    res.json({
+      ok: true,
+      username: req.user.username,
+      neatPlus: expired ? false : !!user?.neatPlus,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
 app.post("/watch/videos", auth, requireScope("watch"), async (req, res) => {
   try {
     const { title, description, fileId, rawUrl, thumbnailFileId, duration, category } = req.body;
-    if (!title || (!fileId && !rawUrl)) return res.status(400).json({ error: "title y fileId o rawUrl requeridos" });
+    if (!title || (!fileId && !rawUrl))
+      return res.status(400).json({ error: "title y (fileId o rawUrl) requeridos" });
 
     const identifier = req.user.userId || req.user.username;
     const database = await getDb();
     const result = await database.collection("watch_videos").insertOne({
-      title, description, fileId: fileId || null, rawUrl: rawUrl || null, thumbnailFileId: thumbnailFileId || null,
+      title, description,
+      fileId: fileId || null,
+      rawUrl: rawUrl || null,
+      thumbnailFileId: thumbnailFileId || null,
       duration: duration || null, category: category || null,
       uploadedBy: identifier, uploaderUsername: req.user.username,
-uploaderVerified: false,
+      uploaderVerified: false,
       likes: [], views: 0, createdAt: new Date()
     });
-    res.status(201).json({ _id: result.insertedId, title, fileId, rawUrl });
+    res.status(201).json({ _id: result.insertedId, title, fileId: fileId || null, rawUrl: rawUrl || null });
   } catch (err) {
     res.status(500).json({ error: "Error interno" });
   }
@@ -2817,145 +2852,94 @@ app.delete("/forms/polls/:id", auth, requireScope("forms"), async (req, res) => 
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
 
-// ── Watch — Upload (Telegram ≤20MB / Filebrowser Plus >20MB / Dropbox raw URL) ──
-// POST /watch/upload
-// - Archivo ≤20MB → sube a Telegram automáticamente
-// - Archivo >20MB + no Plus → 422 con instrucciones de Dropbox
-// - Archivo >20MB + Plus + ?provider=filebrowser → sube a Filebrowser
-// Raw URL (Dropbox, etc.) → el frontend la manda directo al endpoint de crear video sin pasar por aquí
-//
-// Variables de entorno necesarias:
-//   TELEGRAM_BOT_TOKEN          — ya existente
-//   TELEGRAM_STORAGE_CHAT_ID    — ya existente
-//   FB_URL                      — https://files.luciano.qzz.io
-//   FB_USER                     — usuario Neat en Filebrowser
-//   FB_PASS                     — contraseña de la cuenta Neat
-//   FB_WATCH_PATH               — opcional, default /watch
-
-// Sube a Telegram
-async function uploadToTelegram(file, botToken, chatId) {
-  const https = require("https");
-  const FormData = require("form-data");
-  const form = new FormData();
-  form.append("chat_id", chatId);
-  form.append("document", file.buffer, { filename: file.originalname, contentType: file.mimetype });
-
-  const formBuffer = form.getBuffer();
-  const formHeaders = form.getHeaders();
-
-  const tgResponse = await new Promise((resolve, reject) => {
-    const options = {
-      hostname: "api.telegram.org",
-      path: `/bot${botToken}/sendDocument`,
-      method: "POST",
-      headers: { ...formHeaders, "Content-Length": formBuffer.length },
-    };
-    const req = https.request(options, (res) => {
-      let data = "";
-      res.on("data", chunk => data += chunk);
-      res.on("end", () => resolve(data));
-    });
-    req.on("error", reject);
-    req.write(formBuffer);
-    req.end();
-  });
-
-  const tgData = JSON.parse(tgResponse);
-  if (!tgData.ok) throw new Error("Telegram error: " + JSON.stringify(tgData));
-  return { fileId: tgData.result.document.file_id, provider: "telegram" };
-}
-
-// Sube a Filebrowser (solo Plus)
-async function uploadToFilebrowser(file) {
-  const basePath = process.env.FB_WATCH_PATH || "/watch";
-  const crypto = require("crypto");
-  const ext = file.originalname.split(".").pop();
-  const filename = `${Date.now()}-${crypto.randomBytes(6).toString("hex")}.${ext}`;
-  const fbUrl = process.env.FB_URL;
-
-  const loginRes = await fetch(`${fbUrl}/api/login`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username: process.env.FB_USER, password: process.env.FB_PASS }),
-  });
-  if (!loginRes.ok) throw new Error("Filebrowser login fallido");
-  const fbToken = (await loginRes.text()).replace(/"/g, "");
-
-  const uploadRes = await fetch(`${fbUrl}/api/resources${basePath}/${filename}`, {
-    method: "POST",
-    headers: { "X-Auth": fbToken, "Content-Type": file.mimetype },
-    body: file.buffer,
-  });
-  if (!uploadRes.ok) throw new Error("Filebrowser upload fallido: " + uploadRes.status);
-
-  const shareRes = await fetch(`${fbUrl}/api/share${basePath}/${filename}`, {
-    method: "POST",
-    headers: { "X-Auth": fbToken },
-  });
-  if (!shareRes.ok) throw new Error("Filebrowser share fallido");
-  const shareData = await shareRes.json();
-
-  const url = `${fbUrl}/api/public/dl/${shareData.hash}/${filename}`;
-  return { url, path: `${basePath}/${filename}`, provider: "filebrowser" };
-}
-
-app.post("/watch/upload", auth, requireScope("watch"), upload.single("file"), async (req, res) => {
+// ── Watch — Upload a Catbox ───────────────────────────────────────────────────
+// POST /watch/upload/catbox
+// Recibe un archivo, lo sube a catbox.moe y devuelve la URL pública permanente
+app.post("/watch/upload/catbox", auth, requireScope("watch"), upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "Archivo requerido" });
 
-    const TELEGRAM_LIMIT = 20 * 1024 * 1024; // 20MB
-    const isPlus = req.user.neatPlus === true;
-    const forceFilebrowser = req.query.provider === "filebrowser";
-    const botToken = process.env.TELEGRAM_BOT_TOKEN;
-    const chatId = process.env.TELEGRAM_STORAGE_CHAT_ID;
+    const MAX = 200 * 1024 * 1024; // 200MB (límite de catbox)
+    if (req.file.size > MAX)
+      return res.status(413).json({ error: "Archivo demasiado grande (máx 200MB en Catbox)" });
 
-    // Plus eligió Filebrowser explícitamente
-    if (forceFilebrowser) {
-      if (!isPlus)
-        return res.status(403).json({ error: "Se requiere Neat Plus para usar servidores prioritarios" });
-      if (!process.env.FB_URL)
-        return res.status(503).json({ error: "Filebrowser no configurado" });
-      const result = await uploadToFilebrowser(req.file);
-      return res.json({ ok: true, ...result });
-    }
-
-    // ≤20MB → Telegram automático
-    if (req.file.size <= TELEGRAM_LIMIT) {
-      if (!botToken || !chatId)
-        return res.status(503).json({ error: "Telegram no configurado" });
-      const result = await uploadToTelegram(req.file, botToken, chatId);
-      return res.json({ ok: true, ...result });
-    }
-
-    // >20MB → no se puede subir directo a los servidores de Neat
-    return res.status(422).json({
-      error: "too_large",
-      isPlus,
-      message: isPlus
-        ? "El archivo supera 20MB. Puedes subirlo a tu Filebrowser o usar una raw URL (Dropbox, etc.)"
-        : "El archivo supera 20MB. Sube algo que pese menos de 20MB o actualiza a Plus para acceder a servidores prioritarios.",
+    const form = new FormData();
+    form.append("reqtype", "fileupload");
+    form.append("fileToUpload", req.file.buffer, {
+      filename: req.file.originalname,
+      contentType: req.file.mimetype,
     });
 
+    const response = await fetch("https://catbox.moe/user/api.php", {
+      method: "POST",
+      body: form,
+      headers: form.getHeaders(),
+    });
+
+    const text = await response.text();
+
+    // Catbox devuelve directamente la URL o un mensaje de error en texto plano
+    if (!text.startsWith("https://")) {
+      return res.status(500).json({ error: "Error de Catbox: " + text });
+    }
+
+    res.json({ ok: true, url: text.trim(), provider: "catbox" });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Error interno: " + err.message });
+    res.status(500).json({ error: "Error interno" });
   }
 });
 
-// ── Watch — Stream de Telegram (renueva el link al vuelo) ─────────────────────
-// GET /watch/stream/:fileId
-app.get("/watch/stream/:fileId", auth, requireScope("watch"), async (req, res) => {
+// ── Watch — Upload a Archive.org ──────────────────────────────────────────────
+// POST /watch/upload/archive
+// Recibe un archivo, lo sube a archive.org con las credenciales del env y devuelve la URL
+// Requiere ARCHIVE_ACCESS_KEY y ARCHIVE_SECRET_KEY en las variables de entorno
+app.post("/watch/upload/archive", auth, requireScope("watch"), upload.single("file"), async (req, res) => {
   try {
-    const botToken = process.env.TELEGRAM_BOT_TOKEN;
-    if (!botToken) return res.status(503).json({ error: "Telegram no configurado" });
+    if (!req.file) return res.status(400).json({ error: "Archivo requerido" });
 
-    const infoRes = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${req.params.fileId}`);
-    const info = await infoRes.json();
-    if (!info.ok) return res.status(404).json({ error: "Archivo no encontrado en Telegram" });
+    const ACCESS_KEY = process.env.ARCHIVE_ACCESS_KEY;
+    const SECRET_KEY = process.env.ARCHIVE_SECRET_KEY;
+    if (!ACCESS_KEY || !SECRET_KEY)
+      return res.status(503).json({ error: "Archive.org no configurado (faltan ARCHIVE_ACCESS_KEY y ARCHIVE_SECRET_KEY)" });
 
-    const url = `https://api.telegram.org/file/bot${botToken}/${info.result.file_path}`;
-    res.redirect(url);
+    // Generar un identifier único para el item en archive.org
+    const crypto = require("crypto");
+    const identifier = `neat-watch-${req.user.username}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+    const filename = req.file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
+
+    // Archive.org S3-like API: PUT /<identifier>/<filename>
+    const https = require("https");
+    const uploadUrl = `https://s3.us.archive.org/${identifier}/${filename}`;
+
+    const uploadRes = await fetch(uploadUrl, {
+      method: "PUT",
+      headers: {
+        "Authorization": `LOW ${ACCESS_KEY}:${SECRET_KEY}`,
+        "Content-Type": req.file.mimetype,
+        "Content-Length": req.file.size,
+        "x-archive-auto-make-bucket": "1",
+        "x-archive-meta-mediatype": req.file.mimetype.startsWith("video/") ? "movies" : "data",
+        "x-archive-meta-subject": "neat-watch",
+        "x-archive-meta-creator": req.user.username,
+        // hidden = no aparece en búsquedas de archive.org
+        "x-archive-meta-noindex": "1",
+      },
+      body: req.file.buffer,
+    });
+
+    if (!uploadRes.ok) {
+      const errText = await uploadRes.text();
+      return res.status(500).json({ error: "Error subiendo a Archive.org", detail: errText });
+    }
+
+    // La URL del archivo en archive.org es predecible
+    const fileUrl = `https://archive.org/download/${identifier}/${filename}`;
+    const itemUrl = `https://archive.org/details/${identifier}`;
+
+    res.json({ ok: true, url: fileUrl, itemUrl, identifier, provider: "archive" });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: "Error interno" });
   }
 });
