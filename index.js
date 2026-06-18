@@ -2945,8 +2945,7 @@ app.post("/watch/upload/archive", auth, requireScope("watch"), upload.single("fi
   }
 });
 
-// ── Watch — Stream de video vía Telegram ─────────────────────────────────────
-app.get("/watch/stream/:fileId", auth, requireScope("watch"), async (req, res) => {
+app.get("/watch/stream/:fileId", async (req, res) => {
   try {
     if (!TELEGRAM_BOT_TOKEN)
       return res.status(503).json({ error: "TELEGRAM_BOT_TOKEN no configurado" });
