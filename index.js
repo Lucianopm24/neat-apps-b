@@ -2817,55 +2817,22 @@ app.delete("/forms/polls/:id", auth, requireScope("forms"), async (req, res) => 
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
 
-// ── Watch — Upload automático (Telegram ≤20MB / R2 >20MB / Filebrowser si Plus y R2 lleno) ──
+// ── Watch — Upload (Telegram ≤20MB / Filebrowser Plus >20MB / Dropbox raw URL) ──
 // POST /watch/upload
-// El frontend puede forzar un provider con ?provider=telegram|r2|filebrowser
-// Raw URL no pasa por aquí — el frontend la manda directo al endpoint de crear video
+// - Archivo ≤20MB → sube a Telegram automáticamente
+// - Archivo >20MB + no Plus → 422 con instrucciones de Dropbox
+// - Archivo >20MB + Plus + ?provider=filebrowser → sube a Filebrowser
+// Raw URL (Dropbox, etc.) → el frontend la manda directo al endpoint de crear video sin pasar por aquí
 //
 // Variables de entorno necesarias:
-//   TELEGRAM_BOT_TOKEN         — ya existente
-//   TELEGRAM_CHAT_ID           — chat/canal donde se guardan los archivos de Watch
-//   R2_ACCOUNT_ID              — Cloudflare account ID
-//   R2_ACCESS_KEY_ID           — R2 Access Key
-//   R2_SECRET_ACCESS_KEY       — R2 Secret Key
-//   R2_BUCKET                  — nombre del bucket
-//   R2_PUBLIC_URL              — URL pública del bucket (ej: https://pub.tu-r2.com)
-//   R2_QUOTA_BYTES             — cuota máxima en bytes (default: 10737418240 = 10GB)
-//   FB_URL                     — https://files.luciano.qzz.io
-//   FB_USER                    — usuario de Filebrowser (cuenta "Neat")
-//   FB_PASS                    — contraseña de la cuenta Neat en Filebrowser
-//   FB_WATCH_PATH              — ruta dentro de Filebrowser (default: /watch)
+//   TELEGRAM_BOT_TOKEN          — ya existente
+//   TELEGRAM_STORAGE_CHAT_ID    — ya existente
+//   FB_URL                      — https://files.luciano.qzz.io
+//   FB_USER                     — usuario Neat en Filebrowser
+//   FB_PASS                     — contraseña de la cuenta Neat
+//   FB_WATCH_PATH               — opcional, default /watch
 
-const { S3Client, PutObjectCommand, HeadBucketCommand, ListObjectsV2Command } = require("@aws-sdk/client-s3");
-
-function getR2Client() {
-  return new S3Client({
-    region: "auto",
-    endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-    credentials: {
-      accessKeyId: process.env.R2_ACCESS_KEY_ID,
-      secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
-    },
-  });
-}
-
-// Calcula el total de bytes usados en el bucket R2
-async function getR2UsedBytes() {
-  const client = getR2Client();
-  let total = 0;
-  let token;
-  do {
-    const res = await client.send(new ListObjectsV2Command({
-      Bucket: process.env.R2_BUCKET,
-      ContinuationToken: token,
-    }));
-    for (const obj of res.Contents || []) total += obj.Size || 0;
-    token = res.IsTruncated ? res.NextContinuationToken : undefined;
-  } while (token);
-  return total;
-}
-
-// Sube a Telegram, devuelve la URL de descarga via getFile
+// Sube a Telegram
 async function uploadToTelegram(file, botToken, chatId) {
   const https = require("https");
   const FormData = require("form-data");
@@ -2895,30 +2862,7 @@ async function uploadToTelegram(file, botToken, chatId) {
 
   const tgData = JSON.parse(tgResponse);
   if (!tgData.ok) throw new Error("Telegram error: " + JSON.stringify(tgData));
-
-  const fileId = tgData.result.document.file_id;
-
-  // Obtener la URL de descarga temporal (válida ~1 hora, suficiente para guardarla en DB)
-  // Para reproducción se usa el endpoint /watch/stream/:fileId que la renueva al vuelo
-  return { fileId, provider: "telegram" };
-}
-
-// Sube a Cloudflare R2
-async function uploadToR2(file) {
-  const crypto = require("crypto");
-  const ext = file.originalname.split(".").pop();
-  const key = `watch/${Date.now()}-${crypto.randomBytes(6).toString("hex")}.${ext}`;
-  const client = getR2Client();
-
-  await client.send(new PutObjectCommand({
-    Bucket: process.env.R2_BUCKET,
-    Key: key,
-    Body: file.buffer,
-    ContentType: file.mimetype,
-  }));
-
-  const url = `${process.env.R2_PUBLIC_URL}/${key}`;
-  return { url, key, provider: "r2" };
+  return { fileId: tgData.result.document.file_id, provider: "telegram" };
 }
 
 // Sube a Filebrowser (solo Plus)
@@ -2929,35 +2873,28 @@ async function uploadToFilebrowser(file) {
   const filename = `${Date.now()}-${crypto.randomBytes(6).toString("hex")}.${ext}`;
   const fbUrl = process.env.FB_URL;
 
-  // 1. Login — obtener token
   const loginRes = await fetch(`${fbUrl}/api/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username: process.env.FB_USER, password: process.env.FB_PASS }),
   });
   if (!loginRes.ok) throw new Error("Filebrowser login fallido");
-  const fbToken = await loginRes.text();
+  const fbToken = (await loginRes.text()).replace(/"/g, "");
 
-  // 2. Subir archivo
   const uploadRes = await fetch(`${fbUrl}/api/resources${basePath}/${filename}`, {
     method: "POST",
-    headers: {
-      "X-Auth": fbToken.replace(/"/g, ""),
-      "Content-Type": file.mimetype,
-    },
+    headers: { "X-Auth": fbToken, "Content-Type": file.mimetype },
     body: file.buffer,
   });
   if (!uploadRes.ok) throw new Error("Filebrowser upload fallido: " + uploadRes.status);
 
-  // 3. Crear link de descarga público (share)
   const shareRes = await fetch(`${fbUrl}/api/share${basePath}/${filename}`, {
     method: "POST",
-    headers: { "X-Auth": fbToken.replace(/"/g, "") },
+    headers: { "X-Auth": fbToken },
   });
   if (!shareRes.ok) throw new Error("Filebrowser share fallido");
   const shareData = await shareRes.json();
 
-  // La URL raw del archivo en Filebrowser via share
   const url = `${fbUrl}/api/public/dl/${shareData.hash}/${filename}`;
   return { url, path: `${basePath}/${filename}`, provider: "filebrowser" };
 }
@@ -2967,34 +2904,13 @@ app.post("/watch/upload", auth, requireScope("watch"), upload.single("file"), as
     if (!req.file) return res.status(400).json({ error: "Archivo requerido" });
 
     const TELEGRAM_LIMIT = 20 * 1024 * 1024; // 20MB
-    const R2_QUOTA = parseInt(process.env.R2_QUOTA_BYTES || "10737418240"); // 10GB default
-    const forceProvider = req.query.provider; // telegram | r2 | filebrowser (override manual)
     const isPlus = req.user.neatPlus === true;
-
-    const chatId = process.env.TELEGRAM_STORAGE_CHAT_ID;
+    const forceFilebrowser = req.query.provider === "filebrowser";
     const botToken = process.env.TELEGRAM_BOT_TOKEN;
+    const chatId = process.env.TELEGRAM_STORAGE_CHAT_ID;
 
-    // ── Provider forzado manualmente por el usuario ──
-    if (forceProvider === "telegram") {
-      if (req.file.size > TELEGRAM_LIMIT)
-        return res.status(413).json({ error: "El archivo supera el límite de 20MB para Telegram" });
-      if (!botToken || !chatId)
-        return res.status(503).json({ error: "Telegram no configurado" });
-      const result = await uploadToTelegram(req.file, botToken, chatId);
-      return res.json({ ok: true, ...result });
-    }
-
-    if (forceProvider === "r2") {
-      if (!process.env.R2_ACCOUNT_ID)
-        return res.status(503).json({ error: "R2 no configurado" });
-      const used = await getR2UsedBytes();
-      if (used + req.file.size > R2_QUOTA)
-        return res.status(507).json({ error: "Los servidores de Neat están llenos", full: true });
-      const result = await uploadToR2(req.file);
-      return res.json({ ok: true, ...result });
-    }
-
-    if (forceProvider === "filebrowser") {
+    // Plus eligió Filebrowser explícitamente
+    if (forceFilebrowser) {
       if (!isPlus)
         return res.status(403).json({ error: "Se requiere Neat Plus para usar servidores prioritarios" });
       if (!process.env.FB_URL)
@@ -3003,32 +2919,21 @@ app.post("/watch/upload", auth, requireScope("watch"), upload.single("file"), as
       return res.json({ ok: true, ...result });
     }
 
-    // ── Selección automática ──
-    // 1. ≤20MB → Telegram
-    if (req.file.size <= TELEGRAM_LIMIT && botToken && chatId) {
+    // ≤20MB → Telegram automático
+    if (req.file.size <= TELEGRAM_LIMIT) {
+      if (!botToken || !chatId)
+        return res.status(503).json({ error: "Telegram no configurado" });
       const result = await uploadToTelegram(req.file, botToken, chatId);
       return res.json({ ok: true, ...result });
     }
 
-    // 2. >20MB → R2 si hay espacio
-    if (process.env.R2_ACCOUNT_ID) {
-      const used = await getR2UsedBytes();
-      if (used + req.file.size <= R2_QUOTA) {
-        const result = await uploadToR2(req.file);
-        return res.json({ ok: true, ...result });
-      }
-    }
-
-    // 3. R2 lleno → Filebrowser si es Plus
-    if (isPlus && process.env.FB_URL) {
-      const result = await uploadToFilebrowser(req.file);
-      return res.json({ ok: true, ...result });
-    }
-
-    // 4. Sin opciones disponibles
-    return res.status(507).json({
-      error: "Los servidores de Neat están llenos. Sube algo que pese menos de 20MB o actualiza a Plus para obtener acceso a servidores prioritarios.",
-      full: true,
+    // >20MB → no se puede subir directo a los servidores de Neat
+    return res.status(422).json({
+      error: "too_large",
+      isPlus,
+      message: isPlus
+        ? "El archivo supera 20MB. Puedes subirlo a tu Filebrowser o usar una raw URL (Dropbox, etc.)"
+        : "El archivo supera 20MB. Sube algo que pese menos de 20MB o actualiza a Plus para acceder a servidores prioritarios.",
     });
 
   } catch (err) {
@@ -3039,8 +2944,6 @@ app.post("/watch/upload", auth, requireScope("watch"), upload.single("file"), as
 
 // ── Watch — Stream de Telegram (renueva el link al vuelo) ─────────────────────
 // GET /watch/stream/:fileId
-// Redirige al link de descarga temporal de Telegram (válido ~1 hora)
-// Así los fileId de Telegram siguen funcionando aunque el link expire
 app.get("/watch/stream/:fileId", auth, requireScope("watch"), async (req, res) => {
   try {
     const botToken = process.env.TELEGRAM_BOT_TOKEN;
