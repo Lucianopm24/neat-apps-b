@@ -2834,7 +2834,7 @@ app.delete("/forms/polls/:id", auth, requireScope("forms"), async (req, res) => 
 //   FB_URL                     — https://files.luciano.qzz.io
 //   FB_USER                    — usuario de Filebrowser (cuenta "Neat")
 //   FB_PASS                    — contraseña de la cuenta Neat en Filebrowser
-//   FB_WATCH_PATH              — ruta dentro de Filebrowser (default: /Neat/watch)
+//   FB_WATCH_PATH              — ruta dentro de Filebrowser (default: /watch)
 
 const { S3Client, PutObjectCommand, HeadBucketCommand, ListObjectsV2Command } = require("@aws-sdk/client-s3");
 
@@ -2923,7 +2923,7 @@ async function uploadToR2(file) {
 
 // Sube a Filebrowser (solo Plus)
 async function uploadToFilebrowser(file) {
-  const basePath = process.env.FB_WATCH_PATH || "/Neat/watch";
+  const basePath = process.env.FB_WATCH_PATH || "/watch";
   const crypto = require("crypto");
   const ext = file.originalname.split(".").pop();
   const filename = `${Date.now()}-${crypto.randomBytes(6).toString("hex")}.${ext}`;
