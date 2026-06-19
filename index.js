@@ -683,16 +683,24 @@ app.post("/watch/videos", auth, requireScope("watch"), async (req, res) => {
   }
 });
 
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 app.get("/watch/videos", async (req, res) => {
   try {
     const database = await getDb();
-    const { category, uploader, quick, limit = 20, before } = req.query;
+    const { category, uploader, quick, limit = 20, before, q } = req.query;
     const filter = {};
     if (category) filter.category = category;
     if (uploader) filter.uploaderUsername = uploader;
     if (quick === "true") filter.duration = { $lte: 120 };
     if (quick === "false") filter.duration = { $gt: 120 };
     if (before) filter.createdAt = { $lt: new Date(before) };
+    if (q && q.trim()) {
+      const re = new RegExp(escapeRegex(q.trim()), "i");
+      filter.$or = [{ title: re }, { description: re }, { uploaderUsername: re }];
+    }
 
     const videos = await database.collection("watch_videos")
   .find(filter).sort({ createdAt: -1 }).limit(parseInt(limit)).toArray();
