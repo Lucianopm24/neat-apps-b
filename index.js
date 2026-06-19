@@ -1901,7 +1901,7 @@ function randomNoteId(len = 8) {
 // Crear nota
 app.post("/notes", auth, async (req, res) => {
   try {
-    const { title, content, isPublic = true, password, customId } = req.body;
+    const { title, content, visibility: visibilityInput, password, customId } = req.body;
     if (!content) return res.status(400).json({ error: "content requerido" });
 
     const database = await getDb();
@@ -1933,12 +1933,14 @@ app.post("/notes", auth, async (req, res) => {
       passwordHash = await bcrypt.hash(password, 10);
     }
 
+    const visibility = ['public', 'unlisted', 'private'].includes(visibilityInput) ? visibilityInput : 'public';
+
     const note = {
       noteId,
       title: title || null,
       content,
       authorUsername: req.user.username,
-      visibility: ['public','unlisted','private'].includes(visibility) ? visibility : 'public',
+      visibility,
       passwordHash,
       hasPassword: !!password,
       history: [],
@@ -1947,7 +1949,7 @@ app.post("/notes", auth, async (req, res) => {
     };
 
     await database.collection("notes").insertOne(note);
-    res.status(201).json({ noteId, title: note.title, isPublic: note.isPublic, hasPassword: note.hasPassword, createdAt: note.createdAt });
+    res.status(201).json({ noteId, title: note.title, visibility: note.visibility, hasPassword: note.hasPassword, createdAt: note.createdAt });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Error interno" });
@@ -2007,7 +2009,7 @@ app.put("/notes/:id", auth, async (req, res) => {
     if (note.authorUsername !== req.user.username && req.user.role !== "admin")
       return res.status(403).json({ error: "Sin permisos" });
 
-    const { title, content, isPublic, password } = req.body;
+    const { title, content, visibility: visibilityInput, password } = req.body;
 
     // Guardar historial (máx 2 versiones)
     const historyEntry = {
@@ -2023,7 +2025,11 @@ app.put("/notes/:id", auth, async (req, res) => {
     };
     if (title !== undefined) update.title = title;
     if (content !== undefined) update.content = content;
-    if (isPublic !== undefined) update.isPublic = !!isPublic;
+    if (visibilityInput !== undefined) {
+      if (!['public', 'unlisted', 'private'].includes(visibilityInput))
+        return res.status(400).json({ error: "visibility inválido (public, unlisted o private)" });
+      update.visibility = visibilityInput;
+    }
 
     // Cambiar contraseña (solo Plus)
     if (password !== undefined) {
