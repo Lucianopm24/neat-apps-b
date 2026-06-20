@@ -1519,7 +1519,7 @@ const crypto = require("crypto");
 // Registrar cliente OAuth (solo admin)
 app.post("/oauth/clients", auth, async (req, res) => {
   try {
-    const { name, redirectUris, scopes } = req.body;
+    const { name, redirectUris, scopes, isPublic } = req.body;
     if (!name || !redirectUris?.length) return res.status(400).json({ error: "name y redirectUris requeridos" });
 
     const database = await getDb();
@@ -1551,6 +1551,7 @@ app.post("/oauth/clients", auth, async (req, res) => {
       clientSecret: crypto.randomBytes(32).toString("hex"),
       redirectUris,
       scopes: scopes || ["profile"],
+      isPublic: !!isPublic,
       ownerUsername: isAdmin ? null : req.user.username,
       createdAt: new Date()
     };
@@ -2595,12 +2596,12 @@ app.put("/oauth/clients/:clientId", auth, async (req, res) => {
     if (!isAdmin && client.ownerUsername !== req.user.username)
       return res.status(403).json({ error: "Sin permisos" });
 
-    const { name, redirectUris, scopes } = req.body;
+    const { name, redirectUris, scopes, isPublic } = req.body;
     if (!name || !redirectUris?.length) return res.status(400).json({ error: "name y redirectUris requeridos" });
 
     await database.collection("oauth_clients").updateOne(
       { clientId: req.params.clientId },
-      { $set: { name, redirectUris, scopes: scopes || ["profile"] } }
+      { $set: { name, redirectUris, scopes: scopes || ["profile"], isPublic: !!isPublic } }
     );
     res.json({ ok: true });
   } catch { res.status(500).json({ error: "Error interno" }); }
