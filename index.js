@@ -1624,7 +1624,7 @@ if (userCheck?.suspended) return res.status(403).json({
       return res.status(400).json({ error: "redirect_uri no autorizada" });
 
     // Validar scopes pedidos
-    const validScopes = ["openid", "profile", "email", "points", "chatter", "watch", "forums", "forms", "account"];
+    const validScopes = ["openid", "profile", "email", "points", "chatter", "watch", "forums", "forms", "notes", "ruletas", "web", "ntfy", "kv", "account"];
     const requestedScopes = (scopes || ["profile"]).filter(s => validScopes.includes(s));
 
     const code = crypto.randomBytes(32).toString("hex");
@@ -1785,20 +1785,21 @@ app.get("/oauth/tokens", auth, async (req, res) => {
 });
 
 // Userinfo — para apps con scope "profile"
-app.get("/oauth/userinfo", auth, async (req, res) => {
+app.get("/oauth/userinfo", auth, requireScope("profile"), async (req, res) => {
   try {
     const database = await getDb();
-    
+
     const isAdmin = req.user.role === "admin" || req.user.username === ADMIN_USER;
-if (isAdmin) {
-  return res.json({
-    username: req.user.username,
-    email: `${req.user.username}@${EMAIL_DOMAIN}`,
-    verified: true,
-    role: "admin",
-    neatPlus: true
-  });
-}
+    if (isAdmin) {
+      return res.json({
+        sub: req.user.username,
+        username: req.user.username,
+        email: `${req.user.username}@${EMAIL_DOMAIN}`,
+        verified: true,
+        role: "admin",
+        neatPlus: true
+      });
+    }
 
     const user = await database.collection("users")
       .findOne({ username: req.user.username }, { projection: { passwordHash: 0 } });
@@ -1806,8 +1807,9 @@ if (isAdmin) {
 
     // Respetar scopes si es token OAuth
     const scopes = req.user.scopes || ["account"];
-    const response = { username: user.username };
-    if (scopes.includes("profile") || scopes.includes("account")) {
+    // sub siempre se incluye (es el identificador estándar de OIDC)
+    const response = { sub: user.username, username: user.username };
+    if (scopes.includes("profile") || scopes.includes("openid") || scopes.includes("account")) {
       response.bio = user.bio || null;
       response.avatarFileId = user.avatarFileId || null;
       response.verified = !!user.verified;
@@ -1849,10 +1851,10 @@ app.get("/.well-known/openid-configuration", (req, res) => {
     userinfo_endpoint: `${base}/oauth/userinfo`,
     jwks_uri: `${base}/.well-known/jwks.json`,
     registration_endpoint: `${base}/oauth/clients`,
-    scopes_supported: ["openid", "profile", "email", "points", "chatter", "watch", "forums", "account"],
+    scopes_supported: ["openid", "profile", "email", "points", "chatter", "watch", "forums", "forms", "notes", "ruletas", "web", "ntfy", "kv", "account"],
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code"],
-    token_endpoint_auth_methods_supported: ["client_secret_post"],
+    token_endpoint_auth_methods_supported: ["client_secret_post", "none"],
     subject_types_supported: ["public"],
     id_token_signing_alg_values_supported: ["HS256"],
     claims_supported: ["sub", "username", "email", "verified", "neatPlus", "role"]
@@ -3239,10 +3241,9 @@ app.get("/apps/:id", async (req, res) => {
   }
 });
 
-// ── Apps (admin — sin cambios) ─────────────────────────────────────────────────
-// Nota: usa `auth` (no `adminAuth`) para mantener compatibilidad con Neat Astore
-// que ya tenía tokens sin campo `role`. Tokens viejos siguen funcionando.
-app.post("/apps", auth, async (req, res) => {
+// ── Apps ───────────────────────────────────────────────────────────────────────
+// GET es público. POST/PUT/DELETE requieren admin.
+app.post("/apps", adminAuth, async (req, res) => {
   const { name, description, icon, url, category } = req.body;
   if (!name || !url) return res.status(400).json({ error: "name and url required" });
   const database = await getDb();
@@ -3252,7 +3253,7 @@ app.post("/apps", auth, async (req, res) => {
   res.status(201).json({ _id: result.insertedId, name, description, icon, url, category });
 });
 
-app.put("/apps/:id", auth, async (req, res) => {
+app.put("/apps/:id", adminAuth, async (req, res) => {
   try {
     const database = await getDb();
     const { _id, ...data } = req.body;
@@ -3266,7 +3267,7 @@ app.put("/apps/:id", auth, async (req, res) => {
   }
 });
 
-app.delete("/apps/:id", auth, async (req, res) => {
+app.delete("/apps/:id", adminAuth, async (req, res) => {
   try {
     const database = await getDb();
     await database.collection("apps").deleteOne({ _id: new ObjectId(req.params.id) });
