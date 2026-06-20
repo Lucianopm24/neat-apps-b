@@ -246,7 +246,7 @@ const multer = require("multer");
 const FormData = require("form-data");
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
-app.post("/chat/telegram/upload", auth, upload.single("file"), async (req, res) => {
+app.post("/chat/telegram/upload", auth, requireScope("chatter"), upload.single("file"), async (req, res) => {
   try {
     if (!TELEGRAM_BOT_TOKEN)
       return res.status(503).json({ error: "TELEGRAM_BOT_TOKEN no configurado" });
@@ -323,7 +323,7 @@ app.post("/chat/telegram/upload", auth, upload.single("file"), async (req, res) 
   }
 });
 
-app.get("/chat/users/list", auth, async (req, res) => {
+app.get("/chat/users/list", auth, requireScope("chatter"), async (req, res) => {
   try {
     const database = await getDb();
     const users = await database.collection("users")
@@ -335,7 +335,7 @@ app.get("/chat/users/list", auth, async (req, res) => {
 });
 
 // Actualizar perfil (bio + foto de perfil vía Telegram file_id)
-app.put("/chat/me", auth, async (req, res) => {
+app.put("/chat/me", auth, requireScope("chatter"), async (req, res) => {
   try {
     const { bio, avatarFileId } = req.body;
     if (req.user.role === "admin") return res.status(400).json({ error: "Admin no tiene perfil editable" });
@@ -392,7 +392,7 @@ app.post("/chat/login", async (req, res) => {
 // ── Usuarios (gestión) ─────────────────────────────────────────────────────────
 
 // Perfil propio
-app.get("/chat/me", auth, async (req, res) => {
+app.get("/chat/me", auth, requireScope("chatter"), async (req, res) => {
   if (req.user.role === "admin") {
     return res.json({
       username: req.user.username,
@@ -605,7 +605,7 @@ if (!chat.participants.includes(identifier) && req.user.role !== "admin")
 // Recibe un file_id de Telegram y devuelve la URL temporal de descarga.
 // El file_id queda guardado en MongoDB — es permanente.
 // La URL que devuelve Telegram expira, por eso la resolvemos on-demand.
-app.get("/chat/telegram/file/:fileId", auth, async (req, res) => {
+app.get("/chat/telegram/file/:fileId", auth, requireScope("chatter"), async (req, res) => {
   try {
     if (!TELEGRAM_BOT_TOKEN)
       return res.status(503).json({ error: "TELEGRAM_BOT_TOKEN no configurado" });
@@ -842,7 +842,7 @@ res.json(comments.map(c => ({ ...c, authorVerified: verifiedMap[c.authorUsername
   }
 });
 
-app.delete("/watch/comments/:id", auth, async (req, res) => {
+app.delete("/watch/comments/:id", auth, requireScope("watch"), async (req, res) => {
   try {
     const database = await getDb();
     const comment = await database.collection("watch_comments")
@@ -935,7 +935,7 @@ app.get("/chat/users/:username/verified", async (req, res) => {
   }
 });
 
-app.put("/chat/chats/:id", auth, async (req, res) => {
+app.put("/chat/chats/:id", auth, requireScope("chatter"), async (req, res) => {
   try {
     const database = await getDb();
     const { participants } = req.body;
@@ -956,7 +956,7 @@ const INNERNET_EXCHANGE_KEY = process.env.INNERNET_EXCHANGE_KEY;
 const NEAT_PLUS_PRICE = 500; // NP
 
 // Ver balance de NP
-app.get("/neat/points/balance", auth, async (req, res) => {
+app.get("/neat/points/balance", auth, requireScope("points"), async (req, res) => {
   try {
     if (req.user.role === "admin") return res.json({ points: 999999999, neatPlus: true, forever: true });
     const database = await getDb();
@@ -1002,7 +1002,7 @@ app.post("/neat/points/add", auth, async (req, res) => {
 });
 
 // Transferir NP entre usuarios
-app.post("/neat/points/transfer", auth, async (req, res) => {
+app.post("/neat/points/transfer", auth, requireScope("points"), async (req, res) => {
   try {
     const { to, amount } = req.body;
     if (!to || !amount || amount <= 0) return res.status(400).json({ error: "Faltan campos" });
@@ -1026,7 +1026,7 @@ app.post("/neat/points/transfer", auth, async (req, res) => {
 });
 
 // Historial de NP
-app.get("/neat/points/history", auth, async (req, res) => {
+app.get("/neat/points/history", auth, requireScope("points"), async (req, res) => {
   try {
     const database = await getDb();
     const history = await database.collection("np_history")
@@ -1036,7 +1036,7 @@ app.get("/neat/points/history", auth, async (req, res) => {
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
 
-app.post("/neat/points/exchange", auth, async (req, res) => {
+app.post("/neat/points/exchange", auth, requireScope("points"), async (req, res) => {
   try {
     const { lucks, innernetUsername, innernetPassword } = req.body;
     if (!lucks || lucks <= 0 || lucks % 12 !== 0)
@@ -1086,7 +1086,7 @@ app.post("/neat/points/exchange", auth, async (req, res) => {
 });
 
 // Neat Plus — activar con NP
-app.post("/neat/plus/activate", auth, async (req, res) => {
+app.post("/neat/plus/activate", auth, requireScope("points"), async (req, res) => {
   try {
     if (req.user.role === "admin") return res.json({ ok: true, neatPlus: true, forever: true });
     const database = await getDb();
@@ -1108,7 +1108,7 @@ app.post("/neat/plus/activate", auth, async (req, res) => {
 });
 
 // Estado de Neat Plus
-app.get("/neat/plus/status", auth, async (req, res) => {
+app.get("/neat/plus/status", auth, requireScope("points"), async (req, res) => {
   try {
     if (req.user.role === "admin") return res.json({ neatPlus: true, forever: true });
     const database = await getDb();
@@ -1434,7 +1434,7 @@ app.get("/u/:username", async (req, res) => {
 });
 
 // Actualizar perfil de Neat ID
-app.put("/u/:username", auth, async (req, res) => {
+app.put("/u/:username", auth, requireScope("profile"), async (req, res) => {
   try {
     if (req.user.username.toLowerCase() !== req.params.username.toLowerCase() && req.user.role !== "admin")
       return res.status(403).json({ error: "Sin permisos" });
@@ -1490,7 +1490,7 @@ app.get("/u/:username/web", async (req, res) => {
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
 
-app.put("/u/:username/web", auth, async (req, res) => {
+app.put("/u/:username/web", auth, requireScope("web"), async (req, res) => {
   try {
     if (req.user.username.toLowerCase() !== req.params.username.toLowerCase() && req.user.role !== "admin")
       return res.status(403).json({ error: "Sin permisos" });
@@ -1824,6 +1824,135 @@ app.get("/oauth/userinfo", auth, requireScope("profile"), async (req, res) => {
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
 
+// ── OAuth — KV: JSON consolidado del usuario, filtrado por scope ──────────────
+// Cada bloque solo se incluye si el token tiene el scope del dominio
+// correspondiente. "kv" es la llave que habilita el endpoint en sí; el
+// contenido de cada bloque sigue respetando su propio scope.
+app.get("/oauth/kv", auth, requireScope("kv"), async (req, res) => {
+  try {
+    const database = await getDb();
+    const username = req.user.username;
+    const isAdmin = req.user.role === "admin" || username === ADMIN_USER;
+
+    // Token de cuenta completa (no-oauth, o scope "account") ve todo.
+    // Token scoped solo ve los bloques cuyo scope también esté presente.
+    const scopes = req.user.scopes || ["account"];
+    const hasScope = (s) => scopes.includes("account") || scopes.includes(s);
+
+    const result = { sub: username, username };
+
+    // ── profile / email (mismo criterio que /oauth/userinfo) ────────────────
+    if (hasScope("profile") || hasScope("openid")) {
+      if (isAdmin) {
+        result.profile = { verified: true, role: "admin", neatPlus: true };
+      } else {
+        const user = await database.collection("users")
+          .findOne({ username }, { projection: { passwordHash: 0 } });
+        if (user) {
+          result.profile = {
+            bio: user.bio || null,
+            avatarFileId: user.avatarFileId || null,
+            verified: !!user.verified,
+            neatPlus: !!user.neatPlus,
+            role: user.role
+          };
+        }
+      }
+    }
+    if (hasScope("email")) {
+      result.email = isAdmin ? `${username}@${EMAIL_DOMAIN}` :
+        (await database.collection("users").findOne({ username }))?.email || null;
+    }
+
+    // ── points ───────────────────────────────────────────────────────────────
+    if (hasScope("points") && !isAdmin) {
+      const user = await database.collection("users").findOne({ username });
+      const history = await database.collection("np_history")
+        .find({ $or: [{ from: username }, { to: username }] })
+        .sort({ createdAt: -1 }).limit(50).toArray();
+      result.points = {
+        balance: user?.neatPoints || 0,
+        neatPlus: !!user?.neatPlus,
+        history
+      };
+    }
+
+    // ── notes ────────────────────────────────────────────────────────────────
+    if (hasScope("notes")) {
+      const notes = await database.collection("notes")
+        .find({ authorUsername: username })
+        .project({ passwordHash: 0 })
+        .sort({ createdAt: -1 }).toArray();
+      result.notes = notes;
+    }
+
+    // ── ruletas ──────────────────────────────────────────────────────────────
+    if (hasScope("ruletas")) {
+      const ruletas = await database.collection("ruletas")
+        .find({ autorUsername: username })
+        .sort({ createdAt: -1 }).toArray();
+      result.ruletas = ruletas;
+    }
+
+    // ── watch (historial, listas, suscripciones) ────────────────────────────
+    if (hasScope("watch")) {
+      const identifier = req.user.userId || req.user.username;
+      const historyDoc = await database.collection("watch_history").findOne({ username });
+      const lists = await database.collection("watch_lists")
+        .find({ creatorUsername: username }).sort({ createdAt: -1 }).toArray();
+      const subscriptions = await database.collection("watch_subscriptions")
+        .find({ subscriberId: identifier }).toArray();
+      result.watch = {
+        history: historyDoc?.history || [],
+        lists,
+        subscriptions
+      };
+    }
+
+    // ── chatter (chats donde participa) ─────────────────────────────────────
+    if (hasScope("chatter")) {
+      const chats = await database.collection("chats")
+        .find({ participants: username }).sort({ updatedAt: -1 }).toArray();
+      result.chatter = { chats };
+    }
+
+    // ── forums (posts, comentarios y guardados propios) ─────────────────────
+    if (hasScope("forums")) {
+      const posts = await database.collection("forum_posts")
+        .find({ realAuthor: username }).sort({ createdAt: -1 }).toArray();
+      const comments = await database.collection("forum_comments")
+        .find({ authorUsername: username }).sort({ createdAt: -1 }).toArray();
+      const saved = await database.collection("forum_saved")
+        .find({ username }).sort({ savedAt: -1 }).toArray();
+      result.forums = { posts, comments, saved };
+    }
+
+    // ── forms (encuestas creadas) ────────────────────────────────────────────
+    if (hasScope("forms")) {
+      const polls = await database.collection("forms_polls")
+        .find({ creatorUsername: username }).sort({ createdAt: -1 }).toArray();
+      result.forms = { polls };
+    }
+
+    // ── web (sitio personalizado) ────────────────────────────────────────────
+    if (hasScope("web")) {
+      const user = await database.collection("users").findOne({ username });
+      result.web = user?.customWeb || null;
+    }
+
+    // ── ntfy (config de notificaciones) ──────────────────────────────────────
+    if (hasScope("ntfy")) {
+      const user = await database.collection("users").findOne({ username });
+      result.ntfy = { topic: user?.ntfyTopic || null };
+    }
+
+    res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
 app.put("/chat/users/:id/suspend", adminAuth, async (req, res) => {
   try {
     const { suspended, reason } = req.body;
@@ -1901,7 +2030,7 @@ function randomNoteId(len = 8) {
 }
 
 // Crear nota
-app.post("/notes", auth, async (req, res) => {
+app.post("/notes", auth, requireScope("notes"), async (req, res) => {
   try {
     const { title, content, visibility: visibilityInput, password, customId } = req.body;
     if (!content) return res.status(400).json({ error: "content requerido" });
@@ -1992,7 +2121,7 @@ app.get("/notes/:id", async (req, res) => {
 });
 
 // Mis notas
-app.get("/notes/me/list", auth, async (req, res) => {
+app.get("/notes/me/list", auth, requireScope("notes"), async (req, res) => {
   try {
     const database = await getDb();
     const notes = await database.collection("notes")
@@ -2003,7 +2132,7 @@ app.get("/notes/me/list", auth, async (req, res) => {
 });
 
 // Editar nota
-app.put("/notes/:id", auth, async (req, res) => {
+app.put("/notes/:id", auth, requireScope("notes"), async (req, res) => {
   try {
     const database = await getDb();
     const note = await database.collection("notes").findOne({ noteId: req.params.id });
@@ -2049,7 +2178,7 @@ app.put("/notes/:id", auth, async (req, res) => {
 });
 
 // Ver historial (solo Plus)
-app.get("/notes/:id/history", auth, async (req, res) => {
+app.get("/notes/:id/history", auth, requireScope("notes"), async (req, res) => {
   try {
     const database = await getDb();
     const note = await database.collection("notes").findOne({ noteId: req.params.id });
@@ -2067,7 +2196,7 @@ app.get("/notes/:id/history", auth, async (req, res) => {
 });
 
 // Eliminar nota
-app.delete("/notes/:id", auth, async (req, res) => {
+app.delete("/notes/:id", auth, requireScope("notes"), async (req, res) => {
   try {
     const database = await getDb();
     const note = await database.collection("notes").findOne({ noteId: req.params.id });
@@ -2105,7 +2234,7 @@ function randomRuletaId(len = 8) {
 }
 
 // Crear ruleta
-app.post("/ruletas", auth, async (req, res) => {
+app.post("/ruletas", auth, requireScope("ruletas"), async (req, res) => {
   try {
     const { nombre, opciones, colores } = req.body;
     if (!opciones || opciones.length < 2) return res.status(400).json({ error: "Mínimo 2 opciones" });
@@ -2161,7 +2290,7 @@ app.get("/ruletas/:id", async (req, res) => {
 });
 
 // Mis ruletas
-app.get("/ruletas/me/list", auth, async (req, res) => {
+app.get("/ruletas/me/list", auth, requireScope("ruletas"), async (req, res) => {
   try {
     const database = await getDb();
     const ruletas = await database.collection("ruletas")
@@ -2172,7 +2301,7 @@ app.get("/ruletas/me/list", auth, async (req, res) => {
 });
 
 // Girar ruleta (registra resultado)
-app.post("/ruletas/:id/girar", auth, async (req, res) => {
+app.post("/ruletas/:id/girar", auth, requireScope("ruletas"), async (req, res) => {
   try {
     const { resultado } = req.body;
     if (!resultado) return res.status(400).json({ error: "resultado requerido" });
@@ -2195,7 +2324,7 @@ app.post("/ruletas/:id/girar", auth, async (req, res) => {
 });
 
 // Ver historial (solo Plus)
-app.get("/ruletas/:id/historial", auth, async (req, res) => {
+app.get("/ruletas/:id/historial", auth, requireScope("ruletas"), async (req, res) => {
   try {
     const database = await getDb();
     const ruleta = await database.collection("ruletas").findOne({ ruletaId: req.params.id });
@@ -2213,7 +2342,7 @@ app.get("/ruletas/:id/historial", auth, async (req, res) => {
 });
 
 // Editar ruleta
-app.put("/ruletas/:id", auth, async (req, res) => {
+app.put("/ruletas/:id", auth, requireScope("ruletas"), async (req, res) => {
   try {
     const database = await getDb();
     const ruleta = await database.collection("ruletas").findOne({ ruletaId: req.params.id });
@@ -2240,7 +2369,7 @@ app.put("/ruletas/:id", auth, async (req, res) => {
 });
 
 // Eliminar ruleta
-app.delete("/ruletas/:id", auth, async (req, res) => {
+app.delete("/ruletas/:id", auth, requireScope("ruletas"), async (req, res) => {
   try {
     const database = await getDb();
     const ruleta = await database.collection("ruletas").findOne({ ruletaId: req.params.id });
@@ -2419,7 +2548,7 @@ app.put("/watch/lists/:id", auth, requireScope("watch"), async (req, res) => {
 // ── Neat ntfy ─────────────────────────────────────────────────────────────────
 
 // Generar/obtener topic ntfy
-app.post("/ntfy/setup", auth, async (req, res) => {
+app.post("/ntfy/setup", auth, requireScope("ntfy"), async (req, res) => {
   try {
     if (req.user.role === "admin") return res.json({ ok: true, topic: "admin_no_necesita" });
     const database = await getDb();
@@ -2436,7 +2565,7 @@ app.post("/ntfy/setup", auth, async (req, res) => {
 });
 
 // Ver topic actual
-app.get("/ntfy/topic", auth, async (req, res) => {
+app.get("/ntfy/topic", auth, requireScope("ntfy"), async (req, res) => {
   try {
     const database = await getDb();
     const user = await database.collection("users").findOne({ username: req.user.username });
