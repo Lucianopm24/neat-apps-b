@@ -51,6 +51,16 @@ function requireScope(scope) {
   };
 }
 
+// Bloquea CUALQUIER token OAuth, sin importar el scope. Para acciones que
+// nunca deberían poder hacer apps de terceros (cambiar contraseña, gestionar
+// apps OAuth propias, etc.) — solo pasa con tu sesión real (login directo).
+function requireAuth(req, res, next) {
+  if (req.user.type === "oauth") {
+    return res.status(403).json({ error: "Esta acción no está disponible para apps externas" });
+  }
+  next();
+}
+
 // Solo permite admins (role: 'admin')
 function adminAuth(req, res, next) {
   const header = req.headers.authorization;
@@ -346,6 +356,36 @@ app.put("/chat/me", auth, requireScope("chatter"), async (req, res) => {
     );
     res.json({ ok: true });
   } catch (err) {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// Cambiar contraseña — nunca accesible vía OAuth, ni siquiera con scope
+// "account". Solo la sesión real del usuario (login directo) puede tocarla.
+app.put("/chat/me/password", auth, requireAuth, async (req, res) => {
+  try {
+    if (req.user.role === "admin") return res.status(400).json({ error: "Admin no tiene contraseña gestionable aquí" });
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword)
+      return res.status(400).json({ error: "currentPassword y newPassword requeridos" });
+    if (newPassword.length < 6)
+      return res.status(400).json({ error: "La nueva contraseña debe tener al menos 6 caracteres" });
+
+    const database = await getDb();
+    const user = await database.collection("users").findOne({ _id: new ObjectId(req.user.userId) });
+    if (!user) return res.status(404).json({ error: "Usuario no encontrado" });
+
+    const valid = await bcrypt.compare(currentPassword, user.passwordHash);
+    if (!valid) return res.status(401).json({ error: "Contraseña actual incorrecta" });
+
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    await database.collection("users").updateOne(
+      { _id: new ObjectId(req.user.userId) },
+      { $set: { passwordHash } }
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
     res.status(500).json({ error: "Error interno" });
   }
 });
