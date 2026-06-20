@@ -2510,32 +2510,87 @@ const FORMS_QUESTION_TYPES = [
 app.post("/forms/polls", auth, requireScope("forms"), async (req, res) => {
   try {
     const {
-      title, description, questionType, options,
+      title, description, questions, sections,
       accessMode = "public", anonymous = false,
       allowMultipleVotes = false, expiresAt,
-      scaleMin, scaleMax, scaleMinLabel, scaleMaxLabel,
-      gridRows, gridColumns
+      publicResults = false
     } = req.body;
 
     if (!title) return res.status(400).json({ error: "title requerido" });
-    if (!FORMS_QUESTION_TYPES.includes(questionType))
-      return res.status(400).json({ error: "questionType inválido" });
-
-    if (["multiple_choice", "checkboxes", "datetime"].includes(questionType) && (!options || options.length < 2))
-      return res.status(400).json({ error: "Mínimo 2 opciones" });
-
-    if (questionType === "linear_scale") {
-      if (typeof scaleMin !== "number" || typeof scaleMax !== "number" || scaleMin >= scaleMax)
-        return res.status(400).json({ error: "scaleMin y scaleMax inválidos" });
-      if (scaleMax - scaleMin > 10) return res.status(400).json({ error: "Rango máximo de 10" });
-    }
-
-    if (questionType === "grid") {
-      if (!gridRows?.length || !gridColumns?.length)
-        return res.status(400).json({ error: "gridRows y gridColumns requeridos" });
-    }
+    if (!Array.isArray(questions) || questions.length === 0)
+      return res.status(400).json({ error: "questions requerido (al menos 1 pregunta)" });
+    if (questions.length > 50)
+      return res.status(400).json({ error: "Máximo 50 preguntas" });
 
     const database = await getDb();
+    const user = req.user.role === "admin" ? null :
+      await database.collection("users").findOne({ username: req.user.username });
+    const hasPlus = req.user.role === "admin" || !!user?.neatPlus;
+
+    // Secciones — solo Plus. Cada pregunta opcionalmente referencia una
+    // sección por su índice en el array que mandó el cliente.
+    const builtSections = [];
+    if (sections !== undefined) {
+      if (!hasPlus) return res.status(403).json({ error: "Necesitas Neat Plus para usar Secciones" });
+      if (!Array.isArray(sections)) return res.status(400).json({ error: "sections debe ser un array" });
+      if (sections.length > 20) return res.status(400).json({ error: "Máximo 20 secciones" });
+      for (let i = 0; i < sections.length; i++) {
+        const s = sections[i] || {};
+        if (!s.title) return res.status(400).json({ error: `Sección ${i + 1}: title requerido` });
+        builtSections.push({ id: `s${i + 1}_${crypto.randomBytes(3).toString("hex")}`, title: s.title });
+      }
+    }
+
+    const builtQuestions = [];
+    for (let i = 0; i < questions.length; i++) {
+      const q = questions[i] || {};
+      const {
+        questionType, title: qTitle, required = false, options,
+        scaleMin, scaleMax, scaleMinLabel, scaleMaxLabel, gridRows, gridColumns,
+        sectionIndex
+      } = q;
+
+      if (!qTitle) return res.status(400).json({ error: `Pregunta ${i + 1}: title requerido` });
+      if (!FORMS_QUESTION_TYPES.includes(questionType))
+        return res.status(400).json({ error: `Pregunta ${i + 1}: questionType inválido` });
+
+      if (["multiple_choice", "checkboxes", "datetime"].includes(questionType) && (!options || options.length < 2))
+        return res.status(400).json({ error: `Pregunta ${i + 1}: mínimo 2 opciones` });
+
+      if (questionType === "linear_scale") {
+        if (typeof scaleMin !== "number" || typeof scaleMax !== "number" || scaleMin >= scaleMax)
+          return res.status(400).json({ error: `Pregunta ${i + 1}: scaleMin y scaleMax inválidos` });
+        if (scaleMax - scaleMin > 10) return res.status(400).json({ error: `Pregunta ${i + 1}: rango máximo de 10` });
+      }
+
+      if (questionType === "grid") {
+        if (!gridRows?.length || !gridColumns?.length)
+          return res.status(400).json({ error: `Pregunta ${i + 1}: gridRows y gridColumns requeridos` });
+      }
+
+      let sectionId = null;
+      if (sectionIndex !== undefined && sectionIndex !== null) {
+        if (!builtSections[sectionIndex])
+          return res.status(400).json({ error: `Pregunta ${i + 1}: sectionIndex inválido` });
+        sectionId = builtSections[sectionIndex].id;
+      }
+
+      builtQuestions.push({
+        id: `q${i + 1}_${crypto.randomBytes(3).toString("hex")}`,
+        questionType,
+        title: qTitle,
+        required: !!required,
+        sectionId,
+        options: ["multiple_choice", "checkboxes", "datetime"].includes(questionType) ? options : [],
+        scaleMin: questionType === "linear_scale" ? scaleMin : null,
+        scaleMax: questionType === "linear_scale" ? scaleMax : null,
+        scaleMinLabel: questionType === "linear_scale" ? (scaleMinLabel || null) : null,
+        scaleMaxLabel: questionType === "linear_scale" ? (scaleMaxLabel || null) : null,
+        gridRows: questionType === "grid" ? gridRows : null,
+        gridColumns: questionType === "grid" ? gridColumns : null
+      });
+    }
+
     let pollId = randomPollId();
     while (await database.collection("forms_polls").findOne({ pollId })) pollId = randomPollId();
 
@@ -2543,17 +2598,12 @@ app.post("/forms/polls", auth, requireScope("forms"), async (req, res) => {
       pollId,
       title,
       description: description || "",
-      questionType,
-      options: ["multiple_choice", "checkboxes", "datetime"].includes(questionType) ? options : [],
-      scaleMin: questionType === "linear_scale" ? scaleMin : null,
-      scaleMax: questionType === "linear_scale" ? scaleMax : null,
-      scaleMinLabel: questionType === "linear_scale" ? (scaleMinLabel || null) : null,
-      scaleMaxLabel: questionType === "linear_scale" ? (scaleMaxLabel || null) : null,
-      gridRows: questionType === "grid" ? gridRows : null,
-      gridColumns: questionType === "grid" ? gridColumns : null,
+      questions: builtQuestions,
+      sections: builtSections,
       accessMode: ["public", "neat_only"].includes(accessMode) ? accessMode : "public",
       anonymous: !!anonymous,
       allowMultipleVotes: !!allowMultipleVotes,
+      publicResults: !!publicResults,
       expiresAt: expiresAt ? new Date(expiresAt) : null,
       creatorUsername: req.user.username,
       closed: false,
@@ -2589,62 +2639,85 @@ app.get("/forms/polls/:id", async (req, res) => {
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
 
-// Resultados — público, sin auth obligatorio (el creador se identifica vía header opcional)
+// Resultados — ahora requiere estar logueado en Neat (cualquier cuenta, no solo el creador)
+// Resultados — el dueño siempre puede verlos; cualquier otra persona solo si
+// el creador activó publicResults. No exige login salvo para identificarte como dueño.
 app.get("/forms/polls/:id/results", async (req, res) => {
   try {
     const database = await getDb();
     const poll = await database.collection("forms_polls").findOne({ pollId: req.params.id });
     if (!poll) return res.status(404).json({ error: "Poll no encontrada" });
 
+    let requesterUsername = null;
+    const header = req.headers.authorization;
+    if (header) {
+      try { requesterUsername = jwt.verify(header.replace("Bearer ", ""), SECRET).username; } catch {}
+    }
+    const isCreator = requesterUsername === poll.creatorUsername;
+
+    if (!isCreator && !poll.publicResults) {
+      return res.status(403).json({ error: "Los resultados de esta poll son privados", private: true });
+    }
+
     const votes = await database.collection("forms_votes")
       .find({ pollId: req.params.id }).toArray();
 
-    const isCreator = req.headers.authorization &&
-      (() => { try { return jwt.verify(req.headers.authorization.replace("Bearer ", ""), SECRET).username === poll.creatorUsername; } catch { return false; } })();
+    const questions = poll.questions.map(q => {
+      // Empareja cada voto con su respuesta a ESTA pregunta (si la respondió)
+      const pairs = votes
+        .map(v => ({ vote: v, answer: (v.answers || []).find(a => a.questionId === q.id) }))
+        .filter(p => p.answer);
 
-    if (["text", "paragraph", "file_upload"].includes(poll.questionType)) {
-      return res.json({
-        totalResponses: votes.length,
-        responses: isCreator
-          ? votes.map(v => ({
-              value: v.selections[0],
-              voter: poll.anonymous ? null : (v.voterUsername || v.voterName)
-            }))
-          : null
-      });
-    }
+      if (["text", "paragraph", "file_upload"].includes(q.questionType)) {
+        return {
+          questionId: q.id, title: q.title, questionType: q.questionType,
+          totalResponses: pairs.length,
+          responses: isCreator
+            ? pairs.map(p => ({
+                value: p.answer.selections[0],
+                voter: poll.anonymous ? null : (p.vote.voterUsername || p.vote.voterName)
+              }))
+            : null
+        };
+      }
 
-    if (poll.questionType === "linear_scale") {
-      const counts = {};
-      for (let i = poll.scaleMin; i <= poll.scaleMax; i++) counts[i] = 0;
-      votes.forEach(v => { if (counts[v.selections[0]] !== undefined) counts[v.selections[0]]++; });
-      const avg = votes.length ? votes.reduce((s, v) => s + Number(v.selections[0]), 0) / votes.length : 0;
-      return res.json({ totalVotes: votes.length, counts, average: avg });
-    }
+      if (q.questionType === "linear_scale") {
+        const counts = {};
+        for (let i = q.scaleMin; i <= q.scaleMax; i++) counts[i] = 0;
+        pairs.forEach(p => { if (counts[p.answer.selections[0]] !== undefined) counts[p.answer.selections[0]]++; });
+        const avg = pairs.length
+          ? pairs.reduce((s, p) => s + Number(p.answer.selections[0]), 0) / pairs.length
+          : 0;
+        return { questionId: q.id, title: q.title, questionType: q.questionType, totalVotes: pairs.length, counts, average: avg };
+      }
 
-    if (poll.questionType === "grid") {
-      const grid = {};
-      poll.gridRows.forEach(row => {
-        grid[row] = {};
-        poll.gridColumns.forEach(col => grid[row][col] = 0);
-      });
-      votes.forEach(v => {
-        (v.selections || []).forEach(sel => {
-          if (grid[sel.row] && grid[sel.row][sel.column] !== undefined) grid[sel.row][sel.column]++;
+      if (q.questionType === "grid") {
+        const grid = {};
+        q.gridRows.forEach(row => {
+          grid[row] = {};
+          q.gridColumns.forEach(col => grid[row][col] = 0);
         });
-      });
-      return res.json({ totalVotes: votes.length, grid });
-    }
+        pairs.forEach(p => {
+          (p.answer.selections || []).forEach(sel => {
+            if (grid[sel.row] && grid[sel.row][sel.column] !== undefined) grid[sel.row][sel.column]++;
+          });
+        });
+        return { questionId: q.id, title: q.title, questionType: q.questionType, totalVotes: pairs.length, grid };
+      }
 
-    // multiple_choice, checkboxes, datetime
-    const counts = poll.options.map((opt, i) => ({
-      option: opt,
-      count: votes.filter(v => v.selections.includes(i)).length,
-      voters: poll.anonymous ? null : votes.filter(v => v.selections.includes(i)).map(v => v.voterUsername || v.voterName)
-    }));
+      // multiple_choice, checkboxes, datetime
+      const counts = q.options.map((opt, i) => ({
+        option: opt,
+        count: pairs.filter(p => p.answer.selections.includes(i)).length,
+        voters: poll.anonymous ? null : pairs
+          .filter(p => p.answer.selections.includes(i))
+          .map(p => p.vote.voterUsername || p.vote.voterName)
+      }));
+      return { questionId: q.id, title: q.title, questionType: q.questionType, totalVotes: pairs.length, counts };
+    });
 
-    res.json({ totalVotes: votes.length, counts });
-  } catch { res.status(500).json({ error: "Error interno" }); }
+    res.json({ totalResponses: votes.length, questions });
+  } catch (err) { console.error(err); res.status(500).json({ error: "Error interno" }); }
 });
 
 // Votar — público, sin auth obligatorio salvo accessMode === "neat_only"
@@ -2657,7 +2730,8 @@ app.post("/forms/polls/:id/vote", async (req, res) => {
     if (poll.expiresAt && new Date() > new Date(poll.expiresAt))
       return res.status(403).json({ error: "Poll expirada" });
 
-    const { selections, text, gridSelections, scaleValue, fileId, voterName, voterToken } = req.body;
+    const { answers, voterName, voterToken } = req.body;
+    if (!Array.isArray(answers)) return res.status(400).json({ error: "answers requerido" });
 
     let voterUsername = null;
     let resolvedVoterName = null;
@@ -2692,35 +2766,60 @@ app.post("/forms/polls/:id/vote", async (req, res) => {
       }
     }
 
-    let resolvedSelections;
+    const answersByQId = {};
+    answers.forEach(a => { if (a && a.questionId) answersByQId[a.questionId] = a; });
 
-    if (["text", "paragraph"].includes(poll.questionType)) {
-      if (!text) return res.status(400).json({ error: "text requerido" });
-      resolvedSelections = [String(text).slice(0, poll.questionType === "paragraph" ? 5000 : 500)];
+    const resolvedAnswers = [];
+    for (const q of poll.questions) {
+      const a = answersByQId[q.id];
 
-    } else if (poll.questionType === "file_upload") {
-      if (!fileId) return res.status(400).json({ error: "fileId requerido (sube primero con /forms/polls/:id/upload)" });
-      resolvedSelections = [fileId];
+      if (!a) {
+        if (q.required) return res.status(400).json({ error: `Falta responder: ${q.title}` });
+        continue;
+      }
 
-    } else if (poll.questionType === "linear_scale") {
-      if (typeof scaleValue !== "number" || scaleValue < poll.scaleMin || scaleValue > poll.scaleMax)
-        return res.status(400).json({ error: "scaleValue fuera de rango" });
-      resolvedSelections = [scaleValue];
+      let selections;
 
-    } else if (poll.questionType === "grid") {
-      if (!Array.isArray(gridSelections) || !gridSelections.length)
-        return res.status(400).json({ error: "gridSelections requerido" });
-      const valid = gridSelections.every(s => poll.gridRows.includes(s.row) && poll.gridColumns.includes(s.column));
-      if (!valid) return res.status(400).json({ error: "Selección de grid inválida" });
-      resolvedSelections = gridSelections;
+      if (["text", "paragraph"].includes(q.questionType)) {
+        if (!a.text) {
+          if (q.required) return res.status(400).json({ error: `Falta responder: ${q.title}` });
+          continue;
+        }
+        selections = [String(a.text).slice(0, q.questionType === "paragraph" ? 5000 : 500)];
 
-    } else {
-      // multiple_choice, checkboxes, datetime
-      if (!Array.isArray(selections) || !selections.length)
-        return res.status(400).json({ error: "selections requerido" });
-      if (poll.questionType === "multiple_choice" && selections.length > 1)
-        return res.status(400).json({ error: "Esta poll solo permite una opción" });
-      resolvedSelections = selections.filter(i => i >= 0 && i < poll.options.length);
+      } else if (q.questionType === "file_upload") {
+        if (!a.fileId) {
+          if (q.required) return res.status(400).json({ error: `Falta responder: ${q.title}` });
+          continue;
+        }
+        selections = [a.fileId];
+
+      } else if (q.questionType === "linear_scale") {
+        if (typeof a.scaleValue !== "number" || a.scaleValue < q.scaleMin || a.scaleValue > q.scaleMax)
+          return res.status(400).json({ error: `${q.title}: scaleValue fuera de rango` });
+        selections = [a.scaleValue];
+
+      } else if (q.questionType === "grid") {
+        if (!Array.isArray(a.gridSelections) || !a.gridSelections.length) {
+          if (q.required) return res.status(400).json({ error: `Falta responder: ${q.title}` });
+          continue;
+        }
+        const valid = a.gridSelections.every(s => q.gridRows.includes(s.row) && q.gridColumns.includes(s.column));
+        if (!valid) return res.status(400).json({ error: `${q.title}: selección de grid inválida` });
+        selections = a.gridSelections;
+
+      } else {
+        // multiple_choice, checkboxes, datetime
+        if (!Array.isArray(a.selections) || !a.selections.length) {
+          if (q.required) return res.status(400).json({ error: `Falta responder: ${q.title}` });
+          continue;
+        }
+        if (q.questionType === "multiple_choice" && a.selections.length > 1)
+          return res.status(400).json({ error: `${q.title}: solo permite una opción` });
+        selections = a.selections.filter(i => i >= 0 && i < q.options.length);
+      }
+
+      resolvedAnswers.push({ questionId: q.id, selections });
     }
 
     await database.collection("forms_votes").insertOne({
@@ -2728,7 +2827,7 @@ app.post("/forms/polls/:id/vote", async (req, res) => {
       voterUsername,
       voterName: resolvedVoterName,
       voterToken: poll.accessMode === "public" ? resolvedToken : null,
-      selections: resolvedSelections,
+      answers: resolvedAnswers,
       createdAt: new Date()
     });
 
@@ -2748,7 +2847,11 @@ app.post("/forms/polls/:id/upload", upload.single("file"), async (req, res) => {
     const database = await getDb();
     const poll = await database.collection("forms_polls").findOne({ pollId: req.params.id });
     if (!poll) return res.status(404).json({ error: "Poll no encontrada" });
-    if (poll.questionType !== "file_upload") return res.status(400).json({ error: "Esta poll no acepta archivos" });
+
+    const { questionId } = req.query;
+    const question = poll.questions.find(q => q.id === questionId);
+    if (!question) return res.status(400).json({ error: "questionId inválido o faltante" });
+    if (question.questionType !== "file_upload") return res.status(400).json({ error: "Esa pregunta no acepta archivos" });
 
     // Límite: 20MB si el CREADOR es Plus, O si quien responde es Plus. 10MB si ninguno.
     let creatorHasPlus = false;
