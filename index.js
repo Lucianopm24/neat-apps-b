@@ -2507,20 +2507,163 @@ const FORMS_QUESTION_TYPES = [
 ];
 
 // Crear poll — requiere scope 'forms'
+// Helpers compartidos entre crear y editar polls de Forms.
+// existingSections/existingQuestions permiten preservar el id original cuando
+// el cliente manda de vuelta una sección/pregunta que ya existía, para que las
+// respuestas ya guardadas (forms_votes) sigan vinculadas correctamente.
+function buildFormsSections(sections, hasPlus, existingSections = []) {
+  const builtSections = [];
+  if (sections === undefined) return { builtSections };
+  if (!hasPlus) return { error: "Necesitas Neat Plus para usar Secciones" };
+  if (!Array.isArray(sections)) return { error: "sections debe ser un array" };
+  if (sections.length > 20) return { error: "Máximo 20 secciones" };
+  for (let i = 0; i < sections.length; i++) {
+    const s = sections[i] || {};
+    if (!s.title) return { error: `Sección ${i + 1}: title requerido` };
+    const existing = s.id && existingSections.find(es => es.id === s.id);
+    builtSections.push({
+      id: existing ? existing.id : `s${i + 1}_${crypto.randomBytes(3).toString("hex")}`,
+      title: s.title
+    });
+  }
+  return { builtSections };
+}
+
+function buildFormsQuestions(questions, builtSections, existingQuestions = []) {
+  if (!Array.isArray(questions) || questions.length === 0)
+    return { error: "questions requerido (al menos 1 pregunta)" };
+  if (questions.length > 50)
+    return { error: "Máximo 50 preguntas" };
+
+  const builtQuestions = [];
+  for (let i = 0; i < questions.length; i++) {
+    const q = questions[i] || {};
+    const {
+      questionType, title: qTitle, required = false, options,
+      scaleMin, scaleMax, scaleMinLabel, scaleMaxLabel, gridRows, gridColumns,
+      sectionIndex, id: qId
+    } = q;
+
+    if (!qTitle) return { error: `Pregunta ${i + 1}: title requerido` };
+    if (!FORMS_QUESTION_TYPES.includes(questionType))
+      return { error: `Pregunta ${i + 1}: questionType inválido` };
+
+    if (["multiple_choice", "checkboxes", "datetime"].includes(questionType) && (!options || options.length < 2))
+      return { error: `Pregunta ${i + 1}: mínimo 2 opciones` };
+
+    if (questionType === "linear_scale") {
+      if (typeof scaleMin !== "number" || typeof scaleMax !== "number" || scaleMin >= scaleMax)
+        return { error: `Pregunta ${i + 1}: scaleMin y scaleMax inválidos` };
+      if (scaleMax - scaleMin > 10) return { error: `Pregunta ${i + 1}: rango máximo de 10` };
+    }
+
+    if (questionType === "grid") {
+      if (!gridRows?.length || !gridColumns?.length)
+        return { error: `Pregunta ${i + 1}: gridRows y gridColumns requeridos` };
+    }
+
+    let sectionId = null;
+    if (sectionIndex !== undefined && sectionIndex !== null) {
+      if (!builtSections[sectionIndex])
+        return { error: `Pregunta ${i + 1}: sectionIndex inválido` };
+      sectionId = builtSections[sectionIndex].id;
+    }
+
+    // Solo se preserva el id si además el tipo de pregunta no cambió — si cambió
+    // de tipo, las respuestas viejas ya no tendrían sentido con la nueva forma,
+    // así que se trata como una pregunta nueva (las respuestas previas quedan huérfanas, sin romper nada).
+    const existing = qId && existingQuestions.find(eq => eq.id === qId && eq.questionType === questionType);
+
+    builtQuestions.push({
+      id: existing ? existing.id : `q${i + 1}_${crypto.randomBytes(3).toString("hex")}`,
+      questionType,
+      title: qTitle,
+      required: !!required,
+      sectionId,
+      options: ["multiple_choice", "checkboxes", "datetime"].includes(questionType) ? options : [],
+      scaleMin: questionType === "linear_scale" ? scaleMin : null,
+      scaleMax: questionType === "linear_scale" ? scaleMax : null,
+      scaleMinLabel: questionType === "linear_scale" ? (scaleMinLabel || null) : null,
+      scaleMaxLabel: questionType === "linear_scale" ? (scaleMaxLabel || null) : null,
+      gridRows: questionType === "grid" ? gridRows : null,
+      gridColumns: questionType === "grid" ? gridColumns : null
+    });
+  }
+  return { builtQuestions };
+}
+
+// Valida y resuelve answers[] contra las preguntas reales de un poll.
+// Compartido entre votar (crear) y editar una respuesta ya existente.
+function resolveFormsAnswers(poll, answers) {
+  if (!Array.isArray(answers)) return { error: "answers requerido" };
+  const answersByQId = {};
+  answers.forEach(a => { if (a && a.questionId) answersByQId[a.questionId] = a; });
+
+  const resolvedAnswers = [];
+  for (const q of poll.questions) {
+    const a = answersByQId[q.id];
+
+    if (!a) {
+      if (q.required) return { error: `Falta responder: ${q.title}` };
+      continue;
+    }
+
+    let selections;
+
+    if (["text", "paragraph"].includes(q.questionType)) {
+      if (!a.text) {
+        if (q.required) return { error: `Falta responder: ${q.title}` };
+        continue;
+      }
+      selections = [String(a.text).slice(0, q.questionType === "paragraph" ? 5000 : 500)];
+
+    } else if (q.questionType === "file_upload") {
+      if (!a.fileId) {
+        if (q.required) return { error: `Falta responder: ${q.title}` };
+        continue;
+      }
+      selections = [a.fileId];
+
+    } else if (q.questionType === "linear_scale") {
+      if (typeof a.scaleValue !== "number" || a.scaleValue < q.scaleMin || a.scaleValue > q.scaleMax)
+        return { error: `${q.title}: scaleValue fuera de rango` };
+      selections = [a.scaleValue];
+
+    } else if (q.questionType === "grid") {
+      if (!Array.isArray(a.gridSelections) || !a.gridSelections.length) {
+        if (q.required) return { error: `Falta responder: ${q.title}` };
+        continue;
+      }
+      const valid = a.gridSelections.every(s => q.gridRows.includes(s.row) && q.gridColumns.includes(s.column));
+      if (!valid) return { error: `${q.title}: selección de grid inválida` };
+      selections = a.gridSelections;
+
+    } else {
+      // multiple_choice, checkboxes, datetime
+      if (!Array.isArray(a.selections) || !a.selections.length) {
+        if (q.required) return { error: `Falta responder: ${q.title}` };
+        continue;
+      }
+      if (q.questionType === "multiple_choice" && a.selections.length > 1)
+        return { error: `${q.title}: solo permite una opción` };
+      selections = a.selections.filter(i => i >= 0 && i < q.options.length);
+    }
+
+    resolvedAnswers.push({ questionId: q.id, selections });
+  }
+  return { resolvedAnswers };
+}
+
 app.post("/forms/polls", auth, requireScope("forms"), async (req, res) => {
   try {
     const {
       title, description, questions, sections,
       accessMode = "public", anonymous = false,
       allowMultipleVotes = false, expiresAt,
-      publicResults = false
+      publicResults = false, allowEditingResponses = false
     } = req.body;
 
     if (!title) return res.status(400).json({ error: "title requerido" });
-    if (!Array.isArray(questions) || questions.length === 0)
-      return res.status(400).json({ error: "questions requerido (al menos 1 pregunta)" });
-    if (questions.length > 50)
-      return res.status(400).json({ error: "Máximo 50 preguntas" });
 
     const database = await getDb();
     const user = req.user.role === "admin" ? null :
@@ -2529,67 +2672,13 @@ app.post("/forms/polls", auth, requireScope("forms"), async (req, res) => {
 
     // Secciones — solo Plus. Cada pregunta opcionalmente referencia una
     // sección por su índice en el array que mandó el cliente.
-    const builtSections = [];
-    if (sections !== undefined) {
-      if (!hasPlus) return res.status(403).json({ error: "Necesitas Neat Plus para usar Secciones" });
-      if (!Array.isArray(sections)) return res.status(400).json({ error: "sections debe ser un array" });
-      if (sections.length > 20) return res.status(400).json({ error: "Máximo 20 secciones" });
-      for (let i = 0; i < sections.length; i++) {
-        const s = sections[i] || {};
-        if (!s.title) return res.status(400).json({ error: `Sección ${i + 1}: title requerido` });
-        builtSections.push({ id: `s${i + 1}_${crypto.randomBytes(3).toString("hex")}`, title: s.title });
-      }
-    }
+    const sectionsResult = buildFormsSections(sections, hasPlus);
+    if (sectionsResult.error) return res.status(sectionsResult.error.includes("Plus") ? 403 : 400).json({ error: sectionsResult.error });
+    const { builtSections } = sectionsResult;
 
-    const builtQuestions = [];
-    for (let i = 0; i < questions.length; i++) {
-      const q = questions[i] || {};
-      const {
-        questionType, title: qTitle, required = false, options,
-        scaleMin, scaleMax, scaleMinLabel, scaleMaxLabel, gridRows, gridColumns,
-        sectionIndex
-      } = q;
-
-      if (!qTitle) return res.status(400).json({ error: `Pregunta ${i + 1}: title requerido` });
-      if (!FORMS_QUESTION_TYPES.includes(questionType))
-        return res.status(400).json({ error: `Pregunta ${i + 1}: questionType inválido` });
-
-      if (["multiple_choice", "checkboxes", "datetime"].includes(questionType) && (!options || options.length < 2))
-        return res.status(400).json({ error: `Pregunta ${i + 1}: mínimo 2 opciones` });
-
-      if (questionType === "linear_scale") {
-        if (typeof scaleMin !== "number" || typeof scaleMax !== "number" || scaleMin >= scaleMax)
-          return res.status(400).json({ error: `Pregunta ${i + 1}: scaleMin y scaleMax inválidos` });
-        if (scaleMax - scaleMin > 10) return res.status(400).json({ error: `Pregunta ${i + 1}: rango máximo de 10` });
-      }
-
-      if (questionType === "grid") {
-        if (!gridRows?.length || !gridColumns?.length)
-          return res.status(400).json({ error: `Pregunta ${i + 1}: gridRows y gridColumns requeridos` });
-      }
-
-      let sectionId = null;
-      if (sectionIndex !== undefined && sectionIndex !== null) {
-        if (!builtSections[sectionIndex])
-          return res.status(400).json({ error: `Pregunta ${i + 1}: sectionIndex inválido` });
-        sectionId = builtSections[sectionIndex].id;
-      }
-
-      builtQuestions.push({
-        id: `q${i + 1}_${crypto.randomBytes(3).toString("hex")}`,
-        questionType,
-        title: qTitle,
-        required: !!required,
-        sectionId,
-        options: ["multiple_choice", "checkboxes", "datetime"].includes(questionType) ? options : [],
-        scaleMin: questionType === "linear_scale" ? scaleMin : null,
-        scaleMax: questionType === "linear_scale" ? scaleMax : null,
-        scaleMinLabel: questionType === "linear_scale" ? (scaleMinLabel || null) : null,
-        scaleMaxLabel: questionType === "linear_scale" ? (scaleMaxLabel || null) : null,
-        gridRows: questionType === "grid" ? gridRows : null,
-        gridColumns: questionType === "grid" ? gridColumns : null
-      });
-    }
+    const questionsResult = buildFormsQuestions(questions, builtSections);
+    if (questionsResult.error) return res.status(400).json({ error: questionsResult.error });
+    const { builtQuestions } = questionsResult;
 
     let pollId = randomPollId();
     while (await database.collection("forms_polls").findOne({ pollId })) pollId = randomPollId();
@@ -2604,6 +2693,7 @@ app.post("/forms/polls", auth, requireScope("forms"), async (req, res) => {
       anonymous: !!anonymous,
       allowMultipleVotes: !!allowMultipleVotes,
       publicResults: !!publicResults,
+      allowEditingResponses: !!allowEditingResponses,
       expiresAt: expiresAt ? new Date(expiresAt) : null,
       creatorUsername: req.user.username,
       closed: false,
@@ -2731,7 +2821,6 @@ app.post("/forms/polls/:id/vote", async (req, res) => {
       return res.status(403).json({ error: "Poll expirada" });
 
     const { answers, voterName, voterToken } = req.body;
-    if (!Array.isArray(answers)) return res.status(400).json({ error: "answers requerido" });
 
     let voterUsername = null;
     let resolvedVoterName = null;
@@ -2764,74 +2853,70 @@ app.post("/forms/polls/:id/vote", async (req, res) => {
           .findOne({ pollId: req.params.id, voterToken });
         if (already) return res.status(409).json({ error: "Ya votaste en esta poll" });
       }
+
+      // Encuesta pública, pero si el votante igual tiene sesión de Neat,
+      // capturamos su username (sin exigirlo) — así, si el creador habilitó
+      // 'editar respuestas', luego puede identificarse para editar la suya.
+      const header = req.headers.authorization;
+      if (header) {
+        try {
+          const payload = jwt.verify(header.replace("Bearer ", ""), SECRET);
+          if (!(payload.type === "oauth" && !payload.scopes?.includes("forms"))) {
+            voterUsername = payload.username;
+          }
+        } catch { /* token inválido o vencido: se trata como voto anónimo, sin error */ }
+      }
     }
 
-    const answersByQId = {};
-    answers.forEach(a => { if (a && a.questionId) answersByQId[a.questionId] = a; });
-
-    const resolvedAnswers = [];
-    for (const q of poll.questions) {
-      const a = answersByQId[q.id];
-
-      if (!a) {
-        if (q.required) return res.status(400).json({ error: `Falta responder: ${q.title}` });
-        continue;
-      }
-
-      let selections;
-
-      if (["text", "paragraph"].includes(q.questionType)) {
-        if (!a.text) {
-          if (q.required) return res.status(400).json({ error: `Falta responder: ${q.title}` });
-          continue;
-        }
-        selections = [String(a.text).slice(0, q.questionType === "paragraph" ? 5000 : 500)];
-
-      } else if (q.questionType === "file_upload") {
-        if (!a.fileId) {
-          if (q.required) return res.status(400).json({ error: `Falta responder: ${q.title}` });
-          continue;
-        }
-        selections = [a.fileId];
-
-      } else if (q.questionType === "linear_scale") {
-        if (typeof a.scaleValue !== "number" || a.scaleValue < q.scaleMin || a.scaleValue > q.scaleMax)
-          return res.status(400).json({ error: `${q.title}: scaleValue fuera de rango` });
-        selections = [a.scaleValue];
-
-      } else if (q.questionType === "grid") {
-        if (!Array.isArray(a.gridSelections) || !a.gridSelections.length) {
-          if (q.required) return res.status(400).json({ error: `Falta responder: ${q.title}` });
-          continue;
-        }
-        const valid = a.gridSelections.every(s => q.gridRows.includes(s.row) && q.gridColumns.includes(s.column));
-        if (!valid) return res.status(400).json({ error: `${q.title}: selección de grid inválida` });
-        selections = a.gridSelections;
-
-      } else {
-        // multiple_choice, checkboxes, datetime
-        if (!Array.isArray(a.selections) || !a.selections.length) {
-          if (q.required) return res.status(400).json({ error: `Falta responder: ${q.title}` });
-          continue;
-        }
-        if (q.questionType === "multiple_choice" && a.selections.length > 1)
-          return res.status(400).json({ error: `${q.title}: solo permite una opción` });
-        selections = a.selections.filter(i => i >= 0 && i < q.options.length);
-      }
-
-      resolvedAnswers.push({ questionId: q.id, selections });
-    }
+    const result = resolveFormsAnswers(poll, answers);
+    if (result.error) return res.status(400).json({ error: result.error });
 
     await database.collection("forms_votes").insertOne({
       pollId: req.params.id,
       voterUsername,
       voterName: resolvedVoterName,
       voterToken: poll.accessMode === "public" ? resolvedToken : null,
-      answers: resolvedAnswers,
+      answers: result.resolvedAnswers,
       createdAt: new Date()
     });
 
     res.status(201).json({ ok: true, voterToken: poll.accessMode === "public" ? resolvedToken : undefined });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// Editar mi propia respuesta — solo si el creador activó allowEditingResponses,
+// y solo identificándote con cuenta de Neat (no aplica a votos anónimos por token).
+app.put("/forms/polls/:id/vote", auth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const poll = await database.collection("forms_polls").findOne({ pollId: req.params.id });
+    if (!poll) return res.status(404).json({ error: "Poll no encontrada" });
+    if (!poll.allowEditingResponses)
+      return res.status(403).json({ error: "Esta encuesta no permite editar respuestas" });
+    if (poll.closed) return res.status(403).json({ error: "Poll cerrada" });
+    if (poll.expiresAt && new Date() > new Date(poll.expiresAt))
+      return res.status(403).json({ error: "Poll expirada" });
+
+    if (req.user.type === "oauth" && !req.user.scopes?.includes("forms"))
+      return res.status(403).json({ error: "Se requiere scope 'forms'" });
+
+    const existingVote = await database.collection("forms_votes")
+      .findOne({ pollId: req.params.id, voterUsername: req.user.username });
+    if (!existingVote)
+      return res.status(404).json({ error: "No tienes una respuesta registrada en esta encuesta" });
+
+    const result = resolveFormsAnswers(poll, req.body.answers);
+    if (result.error) return res.status(400).json({ error: result.error });
+
+    await database.collection("forms_votes").updateOne(
+      { _id: existingVote._id },
+      { $set: { answers: result.resolvedAnswers, editedAt: new Date() } }
+    );
+
+    res.json({ ok: true });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Error interno" });
@@ -2939,6 +3024,62 @@ app.get("/forms/polls/me/list", auth, requireScope("forms"), async (req, res) =>
       .sort({ createdAt: -1 }).toArray();
     res.json(polls);
   } catch { res.status(500).json({ error: "Error interno" }); }
+});
+
+// Editar poll — solo el creador (o admin), requiere scope 'forms'.
+// Acepta el mismo body que crear (title, description, questions, sections, etc.)
+// y reemplaza la encuesta completa. Si una pregunta/sección manda su "id"
+// original y no cambió de tipo, conserva ese id para no romper las respuestas
+// ya guardadas; si es nueva o cambió de tipo, se le asigna un id nuevo.
+app.put("/forms/polls/:id", auth, requireScope("forms"), async (req, res) => {
+  try {
+    const database = await getDb();
+    const poll = await database.collection("forms_polls").findOne({ pollId: req.params.id });
+    if (!poll) return res.status(404).json({ error: "Poll no encontrada" });
+    if (poll.creatorUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+
+    const {
+      title, description, questions, sections,
+      accessMode, anonymous, allowMultipleVotes, expiresAt,
+      publicResults, allowEditingResponses
+    } = req.body;
+
+    if (!title) return res.status(400).json({ error: "title requerido" });
+
+    const user = req.user.role === "admin" ? null :
+      await database.collection("users").findOne({ username: req.user.username });
+    const hasPlus = req.user.role === "admin" || !!user?.neatPlus;
+
+    const sectionsResult = buildFormsSections(sections, hasPlus, poll.sections || []);
+    if (sectionsResult.error) return res.status(sectionsResult.error.includes("Plus") ? 403 : 400).json({ error: sectionsResult.error });
+    const { builtSections } = sectionsResult;
+
+    const questionsResult = buildFormsQuestions(questions, builtSections, poll.questions || []);
+    if (questionsResult.error) return res.status(400).json({ error: questionsResult.error });
+    const { builtQuestions } = questionsResult;
+
+    const update = {
+      title,
+      description: description || "",
+      questions: builtQuestions,
+      sections: builtSections,
+      accessMode: ["public", "neat_only"].includes(accessMode) ? accessMode : poll.accessMode,
+      anonymous: anonymous !== undefined ? !!anonymous : poll.anonymous,
+      allowMultipleVotes: allowMultipleVotes !== undefined ? !!allowMultipleVotes : poll.allowMultipleVotes,
+      publicResults: publicResults !== undefined ? !!publicResults : poll.publicResults,
+      allowEditingResponses: allowEditingResponses !== undefined ? !!allowEditingResponses : !!poll.allowEditingResponses,
+      expiresAt: expiresAt !== undefined ? (expiresAt ? new Date(expiresAt) : null) : poll.expiresAt,
+      editedAt: new Date()
+    };
+
+    await database.collection("forms_polls").updateOne({ pollId: req.params.id }, { $set: update });
+    const updatedPoll = await database.collection("forms_polls").findOne({ pollId: req.params.id });
+    res.json(updatedPoll);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
 });
 
 // Cerrar poll — requiere scope 'forms'
