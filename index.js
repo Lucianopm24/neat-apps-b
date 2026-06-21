@@ -4395,19 +4395,29 @@ app.delete("/id/users/:slug/link-neat", async (req, res) => {
 // KV STORAGE — para que apps SIN backend tengan persistencia de datos
 // ══════════════════════════════════════════════════════════════════════════════
 // Dos espacios de almacenamiento por Tenant:
-//   - id_app_user_kv: un blob JSON por usuario (privado, max 25KB)
-//   - id_app_public_kv: un blob JSON por app (público, cualquiera lo lee)
+//   - id_app_user_kv:   un blob JSON por usuario (privado, max 25KB)
+//   - id_app_public_kv: un blob JSON por app (público en LECTURA, cualquiera
+//                       lo lee sin auth — pero solo el BACKEND puede escribirlo)
 //
 // MODELO DE CONFIANZA (igual que la "anon key" + RLS de Supabase):
 //   La App Key (pública, va en el navegador) NUNCA es suficiente por sí sola
-//   para escribir. Toda escritura del KV privado exige TAMBIÉN el access_token
-//   del usuario en cuestión — así, aunque alguien copie la App Key, solo puede
-//   actuar como un usuario que YA demostró ser quien dice ser con su propio
-//   token firmado por el servidor (nunca puede falsificar ser otro usuario).
+//   para escribir el KV PRIVADO de un usuario. Esa escritura exige TAMBIÉN el
+//   access_token del usuario en cuestión — así, aunque alguien copie la App
+//   Key, solo puede actuar como un usuario que YA demostró ser quien dice ser
+//   con su propio token firmado por el servidor (nunca puede falsificar ser
+//   otro usuario).
 //
-// Dos caminos para escribir, igual que ya existe para login (tenantAuth):
+// KV privado — dos caminos para escribir, igual que ya existe para login:
 //   1. App Key + access_token de usuario → app sin backend, solo SU dato.
 //   2. x-client-id + x-client-secret      → backend del dev, cualquier usuario.
+//
+// KV público — UN solo camino para escribir, a propósito:
+//   x-client-id + x-client-secret → SOLO el backend del dev. Es una sola
+//   fuente de verdad compartida por toda la app (config, leaderboard, etc.),
+//   así que la App Key —que vive en el navegador de cualquier usuario— NUNCA
+//   puede escribirlo: dejarla haría que cualquier visitante corrompiera el
+//   dato de todos, no solo el suyo. Si tu app no tiene backend, este storage
+//   es de solo lectura para ella.
 
 const KV_MAX_BYTES = 25 * 1024; // 25KB por usuario
 
@@ -4551,8 +4561,13 @@ app.get("/id/apps/:slug/public-kv", async (req, res) => {
 });
 
 // PUT /id/apps/:slug/public-kv — escribir el storage público.
-// App Key sola basta aquí (no hay "usuario" al que proteger — es la config
-// compartida de la app), o client_id/secret del backend.
+// SOLO el backend del tenant puede escribir aquí (x-client-id + x-client-secret,
+// client confidencial). A diferencia del KV privado por usuario, este storage
+// es una sola fuente de verdad compartida por TODA la app — dejar que la App
+// Key (pública, vive en el navegador de cualquier usuario) lo escriba directo
+// significaría que cualquier visitante podría corromper el dato de todos, no
+// solo el suyo. Por eso aquí NO existe el camino "App Key sola": si tu app no
+// tiene backend, este storage es de solo lectura para ella.
 app.put("/id/apps/:slug/public-kv", async (req, res) => {
   try {
     const database = await getDb();
@@ -4562,17 +4577,14 @@ app.put("/id/apps/:slug/public-kv", async (req, res) => {
 
     const clientId = req.headers["x-client-id"] || req.body?.client_id;
     const clientSecret = req.headers["x-client-secret"] || req.body?.client_secret;
-    if (clientId && clientSecret) {
-      const client = await database.collection("id_app_clients").findOne({
-        appSlug: req.params.slug, clientId, clientSecret, isPublic: false
-      });
-      if (!client) return res.status(401).json({ error: "Credenciales de client inválidas" });
-      if (client.suspended) return res.status(403).json({ error: "Client suspendido" });
-    } else {
-      const appKey = req.headers["x-app-key"];
-      if (!appKey || appKey !== app.appKey)
-        return res.status(401).json({ error: "x-app-key inválida o ausente" });
-    }
+    if (!clientId || !clientSecret)
+      return res.status(401).json({ error: "x-client-id y x-client-secret requeridos — el storage público solo lo escribe el backend del tenant" });
+
+    const client = await database.collection("id_app_clients").findOne({
+      appSlug: req.params.slug, clientId, clientSecret, isPublic: false
+    });
+    if (!client) return res.status(401).json({ error: "Credenciales de client inválidas" });
+    if (client.suspended) return res.status(403).json({ error: "Client suspendido" });
 
     const { data } = req.body;
     if (data === undefined) return res.status(400).json({ error: "data requerido" });
@@ -4589,6 +4601,7 @@ app.put("/id/apps/:slug/public-kv", async (req, res) => {
     res.status(500).json({ error: "Error interno" });
   }
 });
+
 
 // ── 15. GESTIÓN DE USUARIOS DEL TENANT (para el dev) ─────────────────────────
 // GET /id/apps/:slug/users
