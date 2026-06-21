@@ -4116,10 +4116,18 @@ app.get("/id/callback", async (req, res) => {
       if (existingUser.suspended)
         return res.redirect(`${redirectUri}?error=access_denied&error_description=${encodeURIComponent("Tu cuenta está suspendida")}`);
       appUserId = existingUser._id.toString();
-      // Actualizar datos del perfil Neat por si cambiaron
+      // El perfil LOCAL manda siempre que el usuario tenga password local —
+      // nunca pisamos su username/email con los de Neat global, o lo dejamos
+      // sin poder loguearse con su contraseña (el login local busca por email
+      // exacto). Solo sincronizamos username/email desde Neat para usuarios
+      // 100% Neat (sin password local, passwordHash null) — esos no tienen
+      // una identidad local que proteger.
+      const syncFields = existingUser.passwordHash
+        ? { lastNeatSync: new Date() }
+        : { email: neatUser.email || existingUser.email, username: neatUser.username, lastNeatSync: new Date() };
       await database.collection("id_app_users").updateOne(
         { _id: existingUser._id },
-        { $set: { email: neatUser.email || existingUser.email, username: neatUser.username, lastNeatSync: new Date() } }
+        { $set: syncFields }
       );
     } else {
       // Primer login con Neat en esta app → crear usuario local vinculado
