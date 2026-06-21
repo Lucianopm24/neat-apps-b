@@ -4916,20 +4916,25 @@ app.post("/id/_migrate/fix-internal-redirects", auth, async (req, res) => {
         continue;
       }
 
+      // OJO: $addToSet y $pull sobre el MISMO campo en una sola updateOne no
+      // está permitido por MongoDB (lanza error) — se separan en dos pasos.
       await database.collection("oauth_clients").updateOne(
         { clientId: app.internalClientId },
-        {
-          $addToSet: { redirectUris: linkingUri },
-          $pull: { redirectUris: oldLinkingUri }
-        }
+        { $addToSet: { redirectUris: linkingUri } }
       );
+      if (hadOld) {
+        await database.collection("oauth_clients").updateOne(
+          { clientId: app.internalClientId },
+          { $pull: { redirectUris: oldLinkingUri } }
+        );
+      }
       results.push({ slug: app.slug, status: "fixed", addedUri: linkingUri, removedOldUri: hadOld ? oldLinkingUri : null });
     }
 
     res.json({ ok: true, totalApps: apps.length, results });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Error interno" });
+    res.status(500).json({ error: "Error interno", detail: err.message });
   }
 });
 
