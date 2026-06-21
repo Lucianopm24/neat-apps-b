@@ -3407,7 +3407,7 @@ app.get("/watch/stream/:fileId", async (req, res) => {
 //   2. client del tenant (confidential) → para que el dev intercambie el code
 //
 // El flujo completo:
-//   id.neat.qzz.io/login?app=APP_SLUG&... → hosted login page
+//   id.neat.qzz.io/?app=APP_SLUG&... → hosted login page
 //   → usuario entra (local o con Neat global)
 //   → Neat emite code al redirect_uri del tenant
 //   → tenant intercambia code → access_token
@@ -3512,12 +3512,13 @@ app.post("/id/apps", auth, requireAuth, async (req, res) => {
     const slugExists = await database.collection("id_apps").findOne({ slug });
     if (slugExists) slug = slug + "-" + crypto.randomBytes(3).toString("hex");
 
-    // Client interno — PKCE, público, usado por id.neat.qzz.io/login
+    // Client interno — PKCE, público, usado por id.neat.qzz.io/ (raíz)
     // redirect_uri interna fija: el propio servidor de Neat redirige el code al tenant
     const internalClient = {
+      name,  // se muestra en la pantalla de aprobación de neat.qzz.io/oauth.html
       clientId: generateClientId(),
       clientSecret: null,  // PKCE público, no tiene secret
-      redirectUris: [`https://id.neat.qzz.io/id/callback`],
+      redirectUris: [`https://neat-apps-b.vercel.app/id/callback`],
       scopes: ["openid", "profile", "email"],
       isPublic: true,
       ownerUsername: req.user.username,
@@ -3569,7 +3570,7 @@ app.post("/id/apps", auth, requireAuth, async (req, res) => {
         isPublic: false
       },
       internalClientId: internalClient.clientId,
-      loginUrl: `https://id.neat.qzz.io/login?app=${slug}`,
+      loginUrl: `https://id.neat.qzz.io/?app=${slug}`,
       createdAt: app.createdAt
     });
   } catch (err) {
@@ -3959,7 +3960,7 @@ app.post("/id/users/:slug/login", async (req, res) => {
 
 // ── 9. TOKEN INTERNO DE PÁGINA ────────────────────────────────────────────────
 // GET /id/apps/:slug/page-token
-// La hosted login page (id.neat.qzz.io/login?app=SLUG) llama esto al cargar
+// La hosted login page (id.neat.qzz.io/?app=SLUG) llama esto al cargar
 // para obtener el internalToken que autoriza registro y login local.
 // Tiene TTL corto (15 min) y es de un solo uso por sesión de página.
 app.get("/id/apps/:slug/page-token", async (req, res) => {
@@ -4020,7 +4021,7 @@ app.get("/id/callback", async (req, res) => {
       body: JSON.stringify({
         code,
         client_id: app.internalClientId,
-        redirect_uri: "https://id.neat.qzz.io/id/callback",
+        redirect_uri: "https://neat-apps-b.vercel.app/id/callback",
         code_verifier: stateData.codeVerifier,
         grant_type: "authorization_code"
       })
@@ -4278,7 +4279,7 @@ app.post("/id/users/:slug/link-neat", async (req, res) => {
       body: JSON.stringify({
         code: neatCode,
         client_id: app.internalClientId,
-        redirect_uri: redirectUri || "https://id.neat.qzz.io/id/callback",
+        redirect_uri: redirectUri || "https://neat-apps-b.vercel.app/id/callback",
         code_verifier: codeVerifier,
         grant_type: "authorization_code"
       })
