@@ -3432,7 +3432,7 @@ function generateAppSlug(name) {
 // reales que el frontend (Cloudflare Pages) ya sirve en ese mismo dominio
 // (ej. /admin → admin.html), antes de que el fallback de SPA cargue
 // login.html. Si agregas más páginas estáticas al mismo dominio, añádelas aquí.
-const RESERVED_APP_SLUGS = new Set(["admin", "login", "id", "tenants", "api", "favicon.ico", "robots.txt", ""]);
+const RESERVED_APP_SLUGS = new Set(["admin", "login", "id", "tenants", "api", "neat-callback", "favicon.ico", "robots.txt", ""]);
 
 // App Key — credencial PÚBLICA de la app (distinta de client_id/client_secret).
 // Va embebida en el JS de una app sin backend; identifica de qué Tenant es la
@@ -3568,7 +3568,10 @@ app.post("/id/apps", auth, requireAuth, async (req, res) => {
       name,  // se muestra en la pantalla de aprobación de neat.qzz.io/oauth.html
       clientId: generateClientId(),
       clientSecret: null,  // PKCE público, no tiene secret
-      redirectUris: [`https://neat-apps-b.vercel.app/id/callback`],
+      redirectUris: [
+        `https://neat-apps-b.vercel.app/id/callback`,        // login normal ("Continuar con Neat")
+        `https://id.neat.qzz.io/${slug}/neat-callback`       // vincular Neat desde sesión local activa
+      ],
       scopes: ["openid", "profile", "email"],
       isPublic: true,
       ownerUsername: req.user.username,
@@ -4871,6 +4874,63 @@ app.get("/tenants/:tenant/.well-known/openid-configuration", async (req, res) =>
 
 app.get("/id/.well-known/jwks.json", (req, res) => {
   res.json({ keys: [] });
+});
+
+// ── MIGRACIÓN TEMPORAL — agregar redirectUri de "vincular Neat" a apps viejas ──
+// POST /id/_migrate/fix-internal-redirects
+// Las apps creadas ANTES de este fix solo tienen registrada la redirectUri de
+// login normal (.../id/callback) en su internalClient — la de "vincular Neat"
+// (id.neat.qzz.io/{slug}/neat-callback) nunca se agregó, así que ese flujo
+// rebotaba con "redirect_uri no autorizado". Este endpoint recorre todas las
+// id_apps, localiza su internalClient en oauth_clients, agrega la URL de
+// vinculación con ruta dedicada si falta, y limpia la variante vieja basada
+// en query param (?linking=1) si quedó de una corrida anterior de esta misma
+// migración — un solo formato vigente, sin acumular redirect_uris muertas.
+// Idempotente — seguro correrlo varias veces. Solo admin. BORRAR este
+// endpoint una vez migradas todas las apps existentes.
+app.post("/id/_migrate/fix-internal-redirects", auth, async (req, res) => {
+  try {
+    if (req.user.role !== "admin") return res.status(403).json({ error: "Solo admin" });
+
+    const database = await getDb();
+    const apps = await database.collection("id_apps").find({}).toArray();
+
+    const results = [];
+    for (const app of apps) {
+      if (!app.internalClientId) {
+        results.push({ slug: app.slug, status: "skip", reason: "sin internalClientId" });
+        continue;
+      }
+      const linkingUri = `https://id.neat.qzz.io/${app.slug}/neat-callback`;
+      const oldLinkingUri = `https://id.neat.qzz.io/${app.slug}?linking=1`;
+      const client = await database.collection("oauth_clients").findOne({ clientId: app.internalClientId });
+      if (!client) {
+        results.push({ slug: app.slug, status: "skip", reason: "internalClient no encontrado" });
+        continue;
+      }
+
+      const hadNew = client.redirectUris?.includes(linkingUri);
+      const hadOld = client.redirectUris?.includes(oldLinkingUri);
+      if (hadNew && !hadOld) {
+        results.push({ slug: app.slug, status: "already-ok" });
+        continue;
+      }
+
+      await database.collection("oauth_clients").updateOne(
+        { clientId: app.internalClientId },
+        {
+          $addToSet: { redirectUris: linkingUri },
+          $pull: { redirectUris: oldLinkingUri }
+        }
+      );
+      results.push({ slug: app.slug, status: "fixed", addedUri: linkingUri, removedOldUri: hadOld ? oldLinkingUri : null });
+    }
+
+    res.json({ ok: true, totalApps: apps.length, results });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
 });
 
 // ── Apps (público — sin cambios para Neat Astore) ─────────────────────────────
