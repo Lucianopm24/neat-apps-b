@@ -3428,6 +3428,15 @@ function generateAppSlug(name) {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 30);
 }
 
+// App Key — credencial PÚBLICA de la app (distinta de client_id/client_secret).
+// Va embebida en el JS de una app sin backend; identifica de qué Tenant es la
+// petición, pero NUNCA es suficiente por sí sola para escribir el storage de
+// un usuario — siempre se combina con el access_token del usuario en cuestión
+// (igual que la "anon key" de Supabase + sus políticas RLS).
+function generateAppKey() {
+  return "nak_" + crypto.randomBytes(16).toString("hex");
+}
+
 // Crea un client OAuth interno de una app (id_app_clients) — esto es lo que
 // permite que App X tenga varios clients propios (web, móvil, admin panel...)
 // todos autenticando contra el mismo pool de usuarios de App X (id_app_users).
@@ -3573,6 +3582,7 @@ app.post("/id/apps", auth, requireAuth, async (req, res) => {
         primaryColor: primaryColor || "#6366f1",
       },
       internalClientId: internalClient.clientId,  // ref al oauth_client interno
+      appKey: generateAppKey(),  // credencial pública — KV storage desde apps sin backend
       suspended: false,
       createdAt: new Date()
     };
@@ -3603,6 +3613,7 @@ app.post("/id/apps", auth, requireAuth, async (req, res) => {
         isPublic: false
       },
       internalClientId: internalClient.clientId,
+      appKey: app.appKey,  // pública — se puede ver de nuevo cuando quieras (a diferencia del secret)
       loginUrl: `https://id.neat.qzz.io/?app=${slug}`,
       createdAt: app.createdAt
     });
@@ -4376,6 +4387,205 @@ app.delete("/id/users/:slug/link-neat", async (req, res) => {
     );
     res.json({ ok: true });
   } catch (err) {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// KV STORAGE — para que apps SIN backend tengan persistencia de datos
+// ══════════════════════════════════════════════════════════════════════════════
+// Dos espacios de almacenamiento por Tenant:
+//   - id_app_user_kv: un blob JSON por usuario (privado, max 25KB)
+//   - id_app_public_kv: un blob JSON por app (público, cualquiera lo lee)
+//
+// MODELO DE CONFIANZA (igual que la "anon key" + RLS de Supabase):
+//   La App Key (pública, va en el navegador) NUNCA es suficiente por sí sola
+//   para escribir. Toda escritura del KV privado exige TAMBIÉN el access_token
+//   del usuario en cuestión — así, aunque alguien copie la App Key, solo puede
+//   actuar como un usuario que YA demostró ser quien dice ser con su propio
+//   token firmado por el servidor (nunca puede falsificar ser otro usuario).
+//
+// Dos caminos para escribir, igual que ya existe para login (tenantAuth):
+//   1. App Key + access_token de usuario → app sin backend, solo SU dato.
+//   2. x-client-id + x-client-secret      → backend del dev, cualquier usuario.
+
+const KV_MAX_BYTES = 25 * 1024; // 25KB por usuario
+
+function kvSizeOk(value) {
+  return Buffer.byteLength(JSON.stringify(value ?? {}), "utf8") <= KV_MAX_BYTES;
+}
+
+// Resuelve quién está escribiendo el KV privado: o un usuario autenticado
+// (vía App Key + su propio access_token), o el backend del tenant (vía
+// client_id/client_secret, que puede tocar el KV de cualquier usuario).
+// Deja req.kvApp y, si aplica, req.kvTargetUserId ya resuelto.
+async function kvUserAuth(req, res, next) {
+  try {
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app) return res.status(404).json({ error: "App no encontrada" });
+    if (app.suspended) return res.status(403).json({ error: "App suspendida" });
+    req.kvApp = app;
+
+    const clientId = req.headers["x-client-id"] || req.body?.client_id;
+    const clientSecret = req.headers["x-client-secret"] || req.body?.client_secret;
+
+    if (clientId && clientSecret) {
+      // Camino backend: puede escribir el KV de CUALQUIER usuario (vía :userId en la ruta)
+      const client = await database.collection("id_app_clients").findOne({
+        appSlug: req.params.slug, clientId, clientSecret, isPublic: false
+      });
+      if (!client) return res.status(401).json({ error: "Credenciales de client inválidas" });
+      if (client.suspended) return res.status(403).json({ error: "Client suspendido" });
+      req.kvAsBackend = true;
+      return next();
+    }
+
+    // Camino app-sin-backend: App Key (header) + access_token del propio usuario
+    const appKey = req.headers["x-app-key"];
+    if (!appKey || appKey !== app.appKey)
+      return res.status(401).json({ error: "x-app-key inválida o ausente" });
+
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).json({ error: "Authorization (access_token del usuario) requerido" });
+    let payload;
+    try {
+      payload = jwt.verify(authHeader.replace("Bearer ", ""), SECRET);
+    } catch {
+      return res.status(401).json({ error: "access_token inválido" });
+    }
+    if (payload.type !== "id_app" || payload.appSlug !== req.params.slug)
+      return res.status(403).json({ error: "Token no corresponde a esta app" });
+
+    req.kvAsBackend = false;
+    req.kvTargetUserId = payload.sub; // SOLO puede tocar su propio storage
+    next();
+  } catch (err) {
+    res.status(500).json({ error: "Error interno" });
+  }
+}
+
+// ── KV PRIVADO POR USUARIO ───────────────────────────────────────────────────
+// GET /id/apps/:slug/kv/:userId — leer el storage de un usuario.
+// :userId es el _id de Mongo del id_app_user (el mismo "sub" del access_token
+// y de /id/userinfo) — no el username ni el email.
+// El propio usuario lee con su access_token (sin necesitar App Key — su JWT
+// ya prueba quién es). El backend del tenant también puede leer cualquier
+// usuario con client_id/secret.
+app.get("/id/apps/:slug/kv/:userId", async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.userId))
+      return res.status(400).json({ error: "userId inválido" });
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app) return res.status(404).json({ error: "App no encontrada" });
+
+    const clientId = req.headers["x-client-id"];
+    const clientSecret = req.headers["x-client-secret"];
+    if (clientId && clientSecret) {
+      const client = await database.collection("id_app_clients").findOne({
+        appSlug: req.params.slug, clientId, clientSecret, isPublic: false
+      });
+      if (!client) return res.status(401).json({ error: "Credenciales de client inválidas" });
+    } else {
+      const authHeader = req.headers.authorization;
+      if (!authHeader) return res.status(401).json({ error: "Authorization requerido" });
+      let payload;
+      try {
+        payload = jwt.verify(authHeader.replace("Bearer ", ""), SECRET);
+      } catch {
+        return res.status(401).json({ error: "access_token inválido" });
+      }
+      if (payload.type !== "id_app" || payload.appSlug !== req.params.slug || payload.sub !== req.params.userId)
+        return res.status(403).json({ error: "Solo puedes leer tu propio storage" });
+    }
+
+    const doc = await database.collection("id_app_user_kv").findOne({
+      appSlug: req.params.slug, userId: req.params.userId
+    });
+    res.json({ data: doc?.data ?? {}, updatedAt: doc?.updatedAt ?? null });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// PUT /id/apps/:slug/kv/:userId — escribir/reemplazar el storage de un usuario.
+// Requiere (App Key + access_token DE ESE MISMO usuario) o (client_id/secret).
+app.put("/id/apps/:slug/kv/:userId", kvUserAuth, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.userId))
+      return res.status(400).json({ error: "userId inválido" });
+    if (!req.kvAsBackend && req.kvTargetUserId !== req.params.userId)
+      return res.status(403).json({ error: "Solo puedes escribir tu propio storage" });
+
+    const { data } = req.body;
+    if (data === undefined) return res.status(400).json({ error: "data requerido" });
+    if (!kvSizeOk(data))
+      return res.status(413).json({ error: `data excede el límite de ${KV_MAX_BYTES / 1024}KB por usuario` });
+
+    const database = await getDb();
+    await database.collection("id_app_user_kv").updateOne(
+      { appSlug: req.params.slug, userId: req.params.userId },
+      { $set: { data, updatedAt: new Date() } },
+      { upsert: true }
+    );
+    res.json({ ok: true, updatedAt: new Date() });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── KV PÚBLICO DEL TENANT ────────────────────────────────────────────────────
+// GET /id/apps/:slug/public-kv — cualquiera lo lee, sin auth (config/datos
+// compartidos de la app, ej. un leaderboard o ajustes globales).
+app.get("/id/apps/:slug/public-kv", async (req, res) => {
+  try {
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app) return res.status(404).json({ error: "App no encontrada" });
+    const doc = await database.collection("id_app_public_kv").findOne({ appSlug: req.params.slug });
+    res.json({ data: doc?.data ?? {}, updatedAt: doc?.updatedAt ?? null });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// PUT /id/apps/:slug/public-kv — escribir el storage público.
+// App Key sola basta aquí (no hay "usuario" al que proteger — es la config
+// compartida de la app), o client_id/secret del backend.
+app.put("/id/apps/:slug/public-kv", async (req, res) => {
+  try {
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app) return res.status(404).json({ error: "App no encontrada" });
+    if (app.suspended) return res.status(403).json({ error: "App suspendida" });
+
+    const clientId = req.headers["x-client-id"] || req.body?.client_id;
+    const clientSecret = req.headers["x-client-secret"] || req.body?.client_secret;
+    if (clientId && clientSecret) {
+      const client = await database.collection("id_app_clients").findOne({
+        appSlug: req.params.slug, clientId, clientSecret, isPublic: false
+      });
+      if (!client) return res.status(401).json({ error: "Credenciales de client inválidas" });
+      if (client.suspended) return res.status(403).json({ error: "Client suspendido" });
+    } else {
+      const appKey = req.headers["x-app-key"];
+      if (!appKey || appKey !== app.appKey)
+        return res.status(401).json({ error: "x-app-key inválida o ausente" });
+    }
+
+    const { data } = req.body;
+    if (data === undefined) return res.status(400).json({ error: "data requerido" });
+    if (!kvSizeOk(data))
+      return res.status(413).json({ error: `data excede el límite de ${KV_MAX_BYTES / 1024}KB` });
+
+    await database.collection("id_app_public_kv").updateOne(
+      { appSlug: req.params.slug },
+      { $set: { data, updatedAt: new Date() } },
+      { upsert: true }
+    );
+    res.json({ ok: true, updatedAt: new Date() });
+  } catch {
     res.status(500).json({ error: "Error interno" });
   }
 });
