@@ -3452,26 +3452,59 @@ async function createIdAppClient(database, { appSlug, name, redirectUris, isPubl
 // (cualquiera de los clients en id_app_clients — web, móvil, admin panel, etc),
 // usando client_id + client_secret. Solo clients confidential pueden usar esto
 // (un client PKCE público no tiene secret, no calificaría para gestión admin).
+// tenantAuth acepta DOS formas de autenticarse, según quién llama:
+//  1. x-client-id + x-client-secret → un backend EXTERNO (el del dev) hablando
+//     con la API. Esta es la forma "real" de OAuth, sin sesión de usuario.
+//  2. Authorization: Bearer <jwt de sesión Neat> → el PROPIO panel admin,
+//     usando la sesión normal del dueño de la app. No necesita credenciales
+//     de client separadas porque ya probó quién es con su sesión Neat.
+// Ambos casos dejan req.idApp poblado; el caso #2 no deja req.idAppClient
+// (no aplica — no hay un client específico involucrado, es el dueño mismo).
 async function tenantAuth(req, res, next) {
   const clientId = req.headers["x-client-id"] || req.body?.client_id;
   const clientSecret = req.headers["x-client-secret"] || req.body?.client_secret;
-  if (!clientId || !clientSecret) {
-    return res.status(401).json({ error: "Credenciales de tenant requeridas (x-client-id, x-client-secret)" });
-  }
+
   try {
     const database = await getDb();
-    const client = await database.collection("id_app_clients").findOne({
-      clientId, clientSecret, isPublic: false
-    });
-    if (!client) return res.status(401).json({ error: "Credenciales inválidas" });
-    if (client.suspended) return res.status(403).json({ error: "Client suspendido" });
 
-    const app = await database.collection("id_apps").findOne({ slug: client.appSlug });
-    if (!app) return res.status(401).json({ error: "App no encontrada" });
+    if (clientId && clientSecret) {
+      // Camino 1: credenciales de client (backend externo)
+      const client = await database.collection("id_app_clients").findOne({
+        clientId, clientSecret, isPublic: false
+      });
+      if (!client) return res.status(401).json({ error: "Credenciales inválidas" });
+      if (client.suspended) return res.status(403).json({ error: "Client suspendido" });
+
+      const app = await database.collection("id_apps").findOne({ slug: client.appSlug });
+      if (!app) return res.status(401).json({ error: "App no encontrada" });
+      if (app.suspended) return res.status(403).json({ error: "App suspendida" });
+
+      req.idApp = app;
+      req.idAppClient = client;
+      return next();
+    }
+
+    // Camino 2: sesión Neat del dueño (panel admin)
+    const header = req.headers.authorization;
+    if (!header) {
+      return res.status(401).json({ error: "Credenciales de tenant requeridas (x-client-id/x-client-secret, o sesión del dueño)" });
+    }
+    let sessionUser;
+    try {
+      sessionUser = jwt.verify(header.replace("Bearer ", ""), SECRET);
+    } catch {
+      return res.status(401).json({ error: "Sesión inválida" });
+    }
+
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app) return res.status(404).json({ error: "App no encontrada" });
+    if (app.ownerUsername !== sessionUser.username && sessionUser.role !== "admin") {
+      return res.status(403).json({ error: "No eres el dueño de esta app" });
+    }
     if (app.suspended) return res.status(403).json({ error: "App suspendida" });
 
     req.idApp = app;
-    req.idAppClient = client;
+    req.idAppClient = null; // no aplica: es el dueño, no un client específico
     next();
   } catch {
     res.status(500).json({ error: "Error interno" });
