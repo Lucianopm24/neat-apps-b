@@ -3428,6 +3428,12 @@ function generateAppSlug(name) {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 30);
 }
 
+// Slugs que no pueden usarse como nombre de Tenant — colisionan con rutas
+// reales que el frontend (Cloudflare Pages) ya sirve en ese mismo dominio
+// (ej. /admin → admin.html), antes de que el fallback de SPA cargue
+// login.html. Si agregas más páginas estáticas al mismo dominio, añádelas aquí.
+const RESERVED_APP_SLUGS = new Set(["admin", "login", "id", "tenants", "api", "favicon.ico", "robots.txt", ""]);
+
 // App Key — credencial PÚBLICA de la app (distinta de client_id/client_secret).
 // Va embebida en el JS de una app sin backend; identifica de qué Tenant es la
 // petición, pero NUNCA es suficiente por sí sola para escribir el storage de
@@ -3549,8 +3555,10 @@ app.post("/id/apps", auth, requireAuth, async (req, res) => {
         return res.status(403).json({ error: "Límite de 1 app gratis alcanzado. Necesitas Neat Plus para más apps." });
     }
 
-    // Slug único
+    // Slug único — y nunca uno reservado (colisionaría con rutas reales
+    // del frontend, ej. /admin)
     let slug = generateAppSlug(name);
+    if (RESERVED_APP_SLUGS.has(slug)) slug = slug + "-" + crypto.randomBytes(3).toString("hex");
     const slugExists = await database.collection("id_apps").findOne({ slug });
     if (slugExists) slug = slug + "-" + crypto.randomBytes(3).toString("hex");
 
@@ -3650,7 +3658,21 @@ app.get("/id/apps/:slug/public", async (req, res) => {
     const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
     if (!app) return res.status(404).json({ error: "App no encontrada" });
     if (app.suspended) return res.status(403).json({ error: "App suspendida" });
-    res.json(app);
+
+    // Si la URL de login trae ?client_id=, exponemos el nombre de ESE client
+    // específico (ej. "InnerNet Web", "InnerNet Móvil") para que la hosted
+    // page pueda mostrar "Usa tu cuenta de {Tenant} para continuar en {Client}"
+    // en vez de solo el nombre genérico del Tenant.
+    let clientName = null;
+    const { client_id } = req.query;
+    if (client_id) {
+      const client = await database.collection("id_app_clients").findOne({
+        appSlug: req.params.slug, clientId: client_id
+      });
+      if (client && !client.suspended) clientName = client.name;
+    }
+
+    res.json({ ...app, clientName });
   } catch {
     res.status(500).json({ error: "Error interno" });
   }
@@ -4088,6 +4110,8 @@ app.get("/id/callback", async (req, res) => {
 
     let appUserId;
     if (existingUser) {
+      if (existingUser.suspended)
+        return res.redirect(`${redirectUri}?error=access_denied&error_description=${encodeURIComponent("Tu cuenta está suspendida")}`);
       appUserId = existingUser._id.toString();
       // Actualizar datos del perfil Neat por si cambiaron
       await database.collection("id_app_users").updateOne(
@@ -4186,6 +4210,7 @@ app.post("/id/token", async (req, res) => {
     const appUser = await database.collection("id_app_users")
       .findOne({ _id: new ObjectId(oauthCode.idAppUserId) });
     if (!appUser) return res.status(404).json({ error: "Usuario no encontrado" });
+    if (appUser.suspended) return res.status(403).json({ error: "Usuario suspendido" });
 
     // Emitir access_token — payload de usuario local (no Neat global)
     const accessToken = jwt.sign(
@@ -4265,6 +4290,7 @@ app.get("/id/userinfo", async (req, res) => {
     const user = await database.collection("id_app_users")
       .findOne({ _id: new ObjectId(payload.sub) });
     if (!user) return res.status(404).json({ error: "Usuario no encontrado" });
+    if (user.suspended) return res.status(403).json({ error: "Usuario suspendido" });
 
     res.json({
       sub: user._id.toString(),
@@ -4467,6 +4493,10 @@ async function kvUserAuth(req, res, next) {
     if (payload.type !== "id_app" || payload.appSlug !== req.params.slug)
       return res.status(403).json({ error: "Token no corresponde a esta app" });
 
+    const targetUser = await database.collection("id_app_users").findOne({ _id: new ObjectId(payload.sub) });
+    if (!targetUser) return res.status(404).json({ error: "Usuario no encontrado" });
+    if (targetUser.suspended) return res.status(403).json({ error: "Usuario suspendido" });
+
     req.kvAsBackend = false;
     req.kvTargetUserId = payload.sub; // SOLO puede tocar su propio storage
     next();
@@ -4508,6 +4538,8 @@ app.get("/id/apps/:slug/kv/:userId", async (req, res) => {
       }
       if (payload.type !== "id_app" || payload.appSlug !== req.params.slug || payload.sub !== req.params.userId)
         return res.status(403).json({ error: "Solo puedes leer tu propio storage" });
+      const targetUser = await database.collection("id_app_users").findOne({ _id: new ObjectId(req.params.userId) });
+      if (targetUser?.suspended) return res.status(403).json({ error: "Usuario suspendido" });
     }
 
     const doc = await database.collection("id_app_user_kv").findOne({
@@ -4782,7 +4814,7 @@ app.get("/id/.well-known/openid-configuration", (req, res) => {
   const base = "https://id.neat.qzz.io";
   res.json({
     issuer: base,
-    authorization_endpoint: `${base}/login`,           // hosted login page (frontend)
+    authorization_endpoint: `${base}/`,           // hosted login page (frontend, raíz)
     token_endpoint: `${base}/id/token`,
     userinfo_endpoint: `${base}/id/userinfo`,
     jwks_uri: `${base}/id/.well-known/jwks.json`,
@@ -4794,6 +4826,47 @@ app.get("/id/.well-known/openid-configuration", (req, res) => {
     id_token_signing_alg_values_supported: ["HS256"],
     claims_supported: ["sub", "username", "email", "neat_user", "neat_user_id"]
   });
+});
+
+// GET /tenants/:tenant/.well-known/openid-configuration
+// Discovery POR TENANT. El protocolo OIDC asume que un issuer = una sola
+// base de usuarios — pero Neat ID Apps sirve N tenants desde un solo dominio,
+// cada uno con su propio pool de id_app_users. Este endpoint hace ese hecho
+// explícito: cada tenant tiene su propio "issuer" lógico (path-based, sin
+// necesitar un dominio físico separado), su propio authorization_endpoint
+// con el slug ya en el path, y su propio token_endpoint con el client
+// implícito a ese tenant (igual que el patrón de WorkOS/Clerk para
+// multi-tenancy, no el de "un dominio Auth0 por cliente").
+app.get("/tenants/:tenant/.well-known/openid-configuration", async (req, res) => {
+  try {
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.tenant });
+    if (!app) return res.status(404).json({ error: "Tenant no encontrado" });
+
+    const base = "https://id.neat.qzz.io";
+    const apiBase = "https://neat-apps-b.vercel.app";
+    res.json({
+      issuer: `${base}/${app.slug}`,
+      authorization_endpoint: `${base}/${app.slug}`,
+      token_endpoint: `${apiBase}/id/token`,
+      userinfo_endpoint: `${apiBase}/id/userinfo`,
+      jwks_uri: `${apiBase}/id/.well-known/jwks.json`,
+      scopes_supported: ["openid", "profile", "email"],
+      response_types_supported: ["code"],
+      grant_types_supported: ["authorization_code"],
+      code_challenge_methods_supported: ["S256"],
+      token_endpoint_auth_methods_supported: ["client_secret_post", "none"],
+      subject_types_supported: ["public"],
+      id_token_signing_alg_values_supported: ["HS256"],
+      claims_supported: ["sub", "username", "email", "neat_user", "neat_user_id"],
+      // Específico de este tenant — no es parte del estándar OIDC, pero útil
+      // para que un dev integre rápido sin tener que pedir el resto a mano.
+      tenant_name: app.name,
+      tenant_branding: app.branding || null
+    });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
 });
 
 app.get("/id/.well-known/jwks.json", (req, res) => {
