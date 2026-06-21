@@ -3393,6 +3393,977 @@ app.get("/watch/stream/:fileId", async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+// NEAT ID APPS — Endpoints nuevos
+// Agregar en index.js junto al bloque OAuth2 existente
+//
+// Nuevas colecciones MongoDB:
+//   id_apps         → apps registradas en Neat ID Apps (distinto a oauth_clients)
+//   id_app_users    → usuarios locales por tenant
+//   id_app_sessions → sesiones locales (para revocación)
+//
+// Cada id_app tiene DOS oauth_clients generados automáticamente:
+//   1. client interno (PKCE, isPublic: true) → usado por la hosted login page
+//   2. client del tenant (confidential) → para que el dev intercambie el code
+//
+// El flujo completo:
+//   id.neat.qzz.io/login?app=APP_SLUG&... → hosted login page
+//   → usuario entra (local o con Neat global)
+//   → Neat emite code al redirect_uri del tenant
+//   → tenant intercambia code → access_token
+//   → tenant llama /id/userinfo/:appSlug → datos del usuario local
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function generateClientId() {
+  return "nid_" + crypto.randomBytes(12).toString("hex");
+}
+
+function generateClientSecret() {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+function generateAppSlug(name) {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 30);
+}
+
+// Middleware: verifica que el request viene de la app registrada
+// usando client_id + client_secret del tenant
+async function tenantAuth(req, res, next) {
+  const clientId = req.headers["x-client-id"] || req.body?.client_id;
+  const clientSecret = req.headers["x-client-secret"] || req.body?.client_secret;
+  if (!clientId || !clientSecret) {
+    return res.status(401).json({ error: "Credenciales de tenant requeridas (x-client-id, x-client-secret)" });
+  }
+  try {
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({
+      "tenantClient.clientId": clientId,
+      "tenantClient.clientSecret": clientSecret
+    });
+    if (!app) return res.status(401).json({ error: "Credenciales inválidas" });
+    if (app.suspended) return res.status(403).json({ error: "App suspendida" });
+    req.idApp = app;
+    next();
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+}
+
+// ── 1. REGISTRO DE APPS ───────────────────────────────────────────────────────
+// POST /id/apps
+// Cualquier usuario Neat registra su app en Neat ID Apps.
+// Genera automáticamente:
+//   - slug único
+//   - client interno (PKCE público) → para la hosted login page
+//   - client del tenant (confidential) → para el backend del dev
+// El "Login con Neat" en la hosted page usa el client interno.
+app.post("/id/apps", auth, requireAuth, async (req, res) => {
+  try {
+    const { name, description, redirectUris, logoUrl, primaryColor, homepageUrl } = req.body;
+
+    if (!name || !redirectUris?.length)
+      return res.status(400).json({ error: "name y redirectUris requeridos" });
+
+    if (!/^[a-zA-Z0-9 _\-]{2,50}$/.test(name))
+      return res.status(400).json({ error: "Nombre inválido (2-50 chars, letras/números/espacios)" });
+
+    const database = await getDb();
+
+    // Límite: 1 app gratis, ilimitado con Neat Plus
+    const user = await database.collection("users").findOne({ username: req.user.username });
+    const isAdmin = req.user.role === "admin";
+    if (!isAdmin) {
+      const myApps = await database.collection("id_apps").countDocuments({ ownerUsername: req.user.username });
+      if (!user?.neatPlus && myApps >= 1)
+        return res.status(403).json({ error: "Límite de 1 app gratis alcanzado. Necesitas Neat Plus para más apps." });
+    }
+
+    // Slug único
+    let slug = generateAppSlug(name);
+    const slugExists = await database.collection("id_apps").findOne({ slug });
+    if (slugExists) slug = slug + "-" + crypto.randomBytes(3).toString("hex");
+
+    // Client interno — PKCE, público, usado por id.neat.qzz.io/login
+    // redirect_uri interna fija: el propio servidor de Neat redirige el code al tenant
+    const internalClient = {
+      clientId: generateClientId(),
+      clientSecret: null,  // PKCE público, no tiene secret
+      redirectUris: [`https://id.neat.qzz.io/id/callback`],
+      scopes: ["openid", "profile", "email"],
+      isPublic: true,
+      ownerUsername: req.user.username,
+      internal: true,
+      forAppSlug: slug,
+      createdAt: new Date()
+    };
+    await database.collection("oauth_clients").insertOne(internalClient);
+
+    // Client del tenant — confidential, el dev usa esto en su backend
+    const tenantClient = {
+      clientId: generateClientId(),
+      clientSecret: generateClientSecret(),
+    };
+
+    const app = {
+      slug,
+      name,
+      description: description || "",
+      homepageUrl: homepageUrl || null,
+      ownerUsername: isAdmin ? null : req.user.username,
+      redirectUris,                     // redirect_uris del dev (su app)
+      branding: {
+        logoUrl: logoUrl || null,
+        primaryColor: primaryColor || "#6366f1",
+      },
+      internalClientId: internalClient.clientId,  // ref al oauth_client interno
+      tenantClient,                                // credentials del tenant
+      suspended: false,
+      createdAt: new Date()
+    };
+
+    await database.collection("id_apps").insertOne(app);
+
+    // También insertar el tenantClient en oauth_clients para que /oauth/token funcione
+    await database.collection("oauth_clients").insertOne({
+      ...tenantClient,
+      name: `${name} (Tenant Client)`,
+      redirectUris,
+      scopes: ["openid", "profile", "email"],
+      isPublic: false,
+      ownerUsername: req.user.username,
+      internal: false,
+      forAppSlug: slug,
+      createdAt: new Date()
+    });
+
+    res.status(201).json({
+      slug,
+      name,
+      description: app.description,
+      branding: app.branding,
+      redirectUris,
+      tenantClient: {
+        clientId: tenantClient.clientId,
+        clientSecret: tenantClient.clientSecret,  // solo se devuelve una vez aquí
+      },
+      internalClientId: internalClient.clientId,
+      loginUrl: `https://id.neat.qzz.io/login?app=${slug}`,
+      createdAt: app.createdAt
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── 2. LISTAR MIS APPS ────────────────────────────────────────────────────────
+// GET /id/apps/me
+app.get("/id/apps/me", auth, requireAuth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const filter = req.user.role === "admin" ? {} : { ownerUsername: req.user.username };
+    const apps = await database.collection("id_apps")
+      .find(filter, { projection: { "tenantClient.clientSecret": 0 } })
+      .sort({ createdAt: -1 }).toArray();
+    res.json(apps);
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── 3. INFO PÚBLICA DE UNA APP (para la hosted login page) ───────────────────
+// GET /id/apps/:slug/public
+// Sin auth — la hosted login page carga esto para saber nombre, logo, colores
+app.get("/id/apps/:slug/public", async (req, res) => {
+  try {
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne(
+      { slug: req.params.slug },
+      { projection: { tenantClient: 0, internalClientId: 0 } }
+    );
+    if (!app) return res.status(404).json({ error: "App no encontrada" });
+    if (app.suspended) return res.status(403).json({ error: "App suspendida" });
+    res.json(app);
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── 4. ACTUALIZAR APP ─────────────────────────────────────────────────────────
+// PUT /id/apps/:slug
+app.put("/id/apps/:slug", auth, requireAuth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app) return res.status(404).json({ error: "App no encontrada" });
+    if (app.ownerUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+
+    const { name, description, redirectUris, logoUrl, primaryColor, homepageUrl } = req.body;
+    const update = {};
+    if (name) update.name = name;
+    if (description !== undefined) update.description = description;
+    if (homepageUrl !== undefined) update.homepageUrl = homepageUrl;
+    if (redirectUris?.length) {
+      update.redirectUris = redirectUris;
+      // Sincronizar redirect_uris en el oauth_client del tenant
+      await database.collection("oauth_clients").updateOne(
+        { clientId: app.tenantClient.clientId },
+        { $set: { redirectUris } }
+      );
+    }
+    if (logoUrl !== undefined) update["branding.logoUrl"] = logoUrl;
+    if (primaryColor !== undefined) update["branding.primaryColor"] = primaryColor;
+
+    await database.collection("id_apps").updateOne({ slug: req.params.slug }, { $set: update });
+    res.json({ ok: true });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── 5. ROTAR CLIENT SECRET ────────────────────────────────────────────────────
+// POST /id/apps/:slug/rotate-secret
+// Genera un nuevo clientSecret para el tenant. El anterior deja de funcionar.
+app.post("/id/apps/:slug/rotate-secret", auth, requireAuth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app) return res.status(404).json({ error: "App no encontrada" });
+    if (app.ownerUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+
+    const newSecret = generateClientSecret();
+
+    await database.collection("id_apps").updateOne(
+      { slug: req.params.slug },
+      { $set: { "tenantClient.clientSecret": newSecret } }
+    );
+    await database.collection("oauth_clients").updateOne(
+      { clientId: app.tenantClient.clientId },
+      { $set: { clientSecret: newSecret } }
+    );
+
+    res.json({ clientId: app.tenantClient.clientId, clientSecret: newSecret });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── 6. ELIMINAR APP ───────────────────────────────────────────────────────────
+// DELETE /id/apps/:slug
+app.delete("/id/apps/:slug", auth, requireAuth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app) return res.status(404).json({ error: "App no encontrada" });
+    if (app.ownerUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+
+    // Eliminar todo lo relacionado
+    await database.collection("id_apps").deleteOne({ slug: req.params.slug });
+    await database.collection("oauth_clients").deleteMany({ forAppSlug: req.params.slug });
+    await database.collection("id_app_users").deleteMany({ appSlug: req.params.slug });
+    await database.collection("id_app_sessions").deleteMany({ appSlug: req.params.slug });
+
+    res.json({ ok: true });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// USUARIOS LOCALES POR TENANT
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── 7. REGISTRO LOCAL ─────────────────────────────────────────────────────────
+// POST /id/users/:slug/register
+// La hosted login page llama esto cuando el usuario se registra en la app tenant.
+// Solo accesible con el internalClientId (PKCE interno) — no público directo.
+// El dev NO llama esto, es uso interno de la hosted page.
+app.post("/id/users/:slug/register", async (req, res) => {
+  try {
+    const { email, password, username, internalToken } = req.body;
+
+    // Verificar internalToken — JWT firmado por Neat con claim { internal: true, appSlug }
+    // La hosted login page recibe este token al cargar la página
+    let tokenPayload;
+    try {
+      tokenPayload = jwt.verify(internalToken, SECRET);
+    } catch {
+      return res.status(401).json({ error: "Token interno inválido" });
+    }
+    if (!tokenPayload.internal || tokenPayload.appSlug !== req.params.slug)
+      return res.status(401).json({ error: "Token interno inválido para esta app" });
+
+    if (!email || !password)
+      return res.status(400).json({ error: "email y password requeridos" });
+    if (password.length < 6)
+      return res.status(400).json({ error: "Password mínimo 6 caracteres" });
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+      return res.status(400).json({ error: "Email inválido" });
+
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app || app.suspended) return res.status(404).json({ error: "App no encontrada" });
+
+    // Email único por tenant
+    const exists = await database.collection("id_app_users").findOne({
+      appSlug: req.params.slug,
+      email: email.toLowerCase()
+    });
+    if (exists) return res.status(409).json({ error: "Email ya registrado en esta app" });
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const result = await database.collection("id_app_users").insertOne({
+      appSlug: req.params.slug,
+      email: email.toLowerCase(),
+      username: username || email.split("@")[0],
+      passwordHash,
+      neatUserId: null,         // null = no ha vinculado cuenta Neat
+      suspended: false,
+      createdAt: new Date()
+    });
+
+    res.status(201).json({ ok: true, userId: result.insertedId });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── 8. LOGIN LOCAL ────────────────────────────────────────────────────────────
+// POST /id/users/:slug/login
+// La hosted login page llama esto para autenticar al usuario local.
+// Devuelve un code OAuth2 listo para que Neat lo redirija al tenant.
+app.post("/id/users/:slug/login", async (req, res) => {
+  try {
+    const { email, password, internalToken, redirectUri, codeChallenge, codeChallengeMethod, state } = req.body;
+
+    let tokenPayload;
+    try {
+      tokenPayload = jwt.verify(internalToken, SECRET);
+    } catch {
+      return res.status(401).json({ error: "Token interno inválido" });
+    }
+    if (!tokenPayload.internal || tokenPayload.appSlug !== req.params.slug)
+      return res.status(401).json({ error: "Token interno inválido para esta app" });
+
+    if (!email || !password)
+      return res.status(400).json({ error: "email y password requeridos" });
+
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app || app.suspended) return res.status(403).json({ error: "App suspendida o no encontrada" });
+
+    const user = await database.collection("id_app_users").findOne({
+      appSlug: req.params.slug,
+      email: email.toLowerCase()
+    });
+    if (!user) return res.status(401).json({ error: "Credenciales inválidas" });
+
+    const valid = await bcrypt.compare(password, user.passwordHash);
+    if (!valid) return res.status(401).json({ error: "Credenciales inválidas" });
+    if (user.suspended) return res.status(403).json({ error: "Cuenta suspendida en esta app" });
+
+    // Validar redirect_uri contra las del tenant
+    const finalRedirectUri = redirectUri || app.redirectUris[0];
+    if (!app.redirectUris.includes(finalRedirectUri))
+      return res.status(400).json({ error: "redirect_uri no autorizada" });
+
+    // Generar code OAuth2 — referencia al usuario local
+    const code = crypto.randomBytes(32).toString("hex");
+    await database.collection("oauth_codes").insertOne({
+      code,
+      clientId: app.tenantClient.clientId,
+      // username vacío — es usuario local, no Neat global
+      username: null,
+      idAppUserId: user._id.toString(),
+      appSlug: req.params.slug,
+      redirectUri: finalRedirectUri,
+      scopes: ["openid", "profile", "email"],
+      codeChallenge: codeChallenge || null,
+      codeChallengeMethod: codeChallengeMethod || "S256",
+      expiresAt: new Date(Date.now() + 5 * 60 * 1000),
+      used: false,
+      type: "id_app_local"   // distingue de los codes Neat globales
+    });
+
+    res.json({ code, redirectUri: finalRedirectUri, state: state || null });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── 9. TOKEN INTERNO DE PÁGINA ────────────────────────────────────────────────
+// GET /id/apps/:slug/page-token
+// La hosted login page (id.neat.qzz.io/login?app=SLUG) llama esto al cargar
+// para obtener el internalToken que autoriza registro y login local.
+// Tiene TTL corto (15 min) y es de un solo uso por sesión de página.
+app.get("/id/apps/:slug/page-token", async (req, res) => {
+  try {
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app || app.suspended) return res.status(404).json({ error: "App no encontrada" });
+
+    const token = jwt.sign(
+      { internal: true, appSlug: req.params.slug },
+      SECRET,
+      { expiresIn: "15m" }
+    );
+    res.json({ token });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── 10. CALLBACK INTERNO ──────────────────────────────────────────────────────
+// GET /id/callback
+// La hosted login page usa el client interno (PKCE) para el flujo "Login con Neat".
+// Neat redirige aquí después de que el usuario Neat global aprueba.
+// Neat convierte el code Neat → crea/actualiza id_app_user vinculado → emite code del tenant.
+// El frontend de id.neat.qzz.io hace este intercambio internamente y redirige al tenant.
+app.get("/id/callback", async (req, res) => {
+  try {
+    const { code, state } = req.query;
+    if (!code || !state) return res.status(400).send("Parámetros faltantes");
+
+    // state codifica: appSlug + redirectUri + codeChallenge del tenant
+    let stateData;
+    try {
+      stateData = JSON.parse(Buffer.from(state, "base64url").toString());
+    } catch {
+      return res.status(400).send("State inválido");
+    }
+    const { appSlug, redirectUri, codeChallenge, codeChallengeMethod, tenantState } = stateData;
+
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: appSlug });
+    if (!app) return res.status(404).send("App no encontrada");
+
+    // Intercambiar el code Neat (interno, PKCE) → access_token Neat
+    // code_verifier está en stateData (la hosted page lo generó y pasó en state)
+    const tokenRes = await fetch("https://neat-apps-b.vercel.app/oauth/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        code,
+        client_id: app.internalClientId,
+        redirect_uri: "https://id.neat.qzz.io/id/callback",
+        code_verifier: stateData.codeVerifier,
+        grant_type: "authorization_code"
+      })
+    });
+    const tokenData = await tokenRes.json();
+    if (!tokenData.access_token) return res.status(400).send("Error obteniendo token Neat");
+
+    // Obtener datos del usuario Neat
+    const userRes = await fetch("https://neat-apps-b.vercel.app/oauth/userinfo", {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` }
+    });
+    const neatUser = await userRes.json();
+    if (!neatUser.sub) return res.status(400).send("Error obteniendo perfil Neat");
+
+    // Crear o actualizar id_app_user vinculado a la cuenta Neat
+    const existingUser = await database.collection("id_app_users").findOne({
+      appSlug,
+      neatUserId: neatUser.sub
+    });
+
+    let appUserId;
+    if (existingUser) {
+      appUserId = existingUser._id.toString();
+      // Actualizar datos del perfil Neat por si cambiaron
+      await database.collection("id_app_users").updateOne(
+        { _id: existingUser._id },
+        { $set: { email: neatUser.email || existingUser.email, username: neatUser.username, lastNeatSync: new Date() } }
+      );
+    } else {
+      // Primer login con Neat en esta app → crear usuario local vinculado
+      const result = await database.collection("id_app_users").insertOne({
+        appSlug,
+        email: neatUser.email || `${neatUser.username}@neat.qzz.io`,
+        username: neatUser.username,
+        passwordHash: null,       // no tiene password local, entra solo con Neat
+        neatUserId: neatUser.sub, // vinculado
+        verified: !!neatUser.verified,
+        suspended: false,
+        createdAt: new Date()
+      });
+      appUserId = result.insertedId.toString();
+    }
+
+    // Emitir code del tenant
+    const tenantCode = crypto.randomBytes(32).toString("hex");
+    await database.collection("oauth_codes").insertOne({
+      code: tenantCode,
+      clientId: app.tenantClient.clientId,
+      username: null,
+      idAppUserId: appUserId,
+      appSlug,
+      redirectUri,
+      scopes: ["openid", "profile", "email"],
+      codeChallenge: codeChallenge || null,
+      codeChallengeMethod: codeChallengeMethod || "S256",
+      expiresAt: new Date(Date.now() + 5 * 60 * 1000),
+      used: false,
+      type: "id_app_neat"   // entró con Neat global
+    });
+
+    // Redirigir al tenant con el code
+    const params = new URLSearchParams({ code: tenantCode });
+    if (tenantState) params.set("state", tenantState);
+    res.redirect(`${redirectUri}?${params.toString()}`);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Error interno");
+  }
+});
+
+// ── 11. TOKEN DEL TENANT (intercambio de code) ────────────────────────────────
+// POST /id/token
+// El backend del dev llama esto para intercambiar el code por un access_token.
+// Funciona para codes de tipo id_app_local e id_app_neat.
+// Sobrecarga el /oauth/token existente — AGREGAR ANTES del handler de /oauth/token
+// O usar este endpoint separado /id/token (recomendado para no romper nada).
+app.post("/id/token", async (req, res) => {
+  try {
+    const code = req.body.code;
+    const clientId = req.body.client_id || req.body.clientId;
+    const clientSecret = req.body.client_secret || req.body.clientSecret;
+    const redirectUri = req.body.redirect_uri || req.body.redirectUri;
+    const codeVerifier = req.body.code_verifier || req.body.codeVerifier;
+
+    if (!code || !clientId)
+      return res.status(400).json({ error: "code y client_id requeridos" });
+
+    const database = await getDb();
+    const oauthCode = await database.collection("oauth_codes").findOne({
+      code, clientId,
+      type: { $in: ["id_app_local", "id_app_neat"] }
+    });
+
+    if (!oauthCode) return res.status(400).json({ error: "Código inválido o no es de Neat ID Apps" });
+    if (oauthCode.used) return res.status(400).json({ error: "Código ya usado" });
+    if (new Date() > oauthCode.expiresAt) return res.status(400).json({ error: "Código expirado" });
+    if (oauthCode.redirectUri !== redirectUri) return res.status(400).json({ error: "redirect_uri no coincide" });
+
+    // Verificar credenciales del tenant (secret o PKCE)
+    const client = await database.collection("oauth_clients").findOne({ clientId });
+    if (!client) return res.status(401).json({ error: "Cliente no encontrado" });
+
+    if (oauthCode.codeChallenge) {
+      if (!codeVerifier) return res.status(400).json({ error: "code_verifier requerido" });
+      const hash = crypto.createHash("sha256").update(codeVerifier).digest("base64url");
+      if (hash !== oauthCode.codeChallenge) return res.status(401).json({ error: "code_verifier inválido" });
+    } else {
+      if (!clientSecret || client.clientSecret !== clientSecret)
+        return res.status(401).json({ error: "client_secret inválido" });
+    }
+
+    await database.collection("oauth_codes").updateOne({ code }, { $set: { used: true } });
+
+    // Cargar usuario local
+    const appUser = await database.collection("id_app_users")
+      .findOne({ _id: new ObjectId(oauthCode.idAppUserId) });
+    if (!appUser) return res.status(404).json({ error: "Usuario no encontrado" });
+
+    // Emitir access_token — payload de usuario local (no Neat global)
+    const accessToken = jwt.sign(
+      {
+        type: "id_app",
+        appSlug: oauthCode.appSlug,
+        sub: appUser._id.toString(),
+        username: appUser.username,
+        email: appUser.email,
+        neatUserId: appUser.neatUserId || null,
+        isNeatUser: !!appUser.neatUserId,
+      },
+      SECRET,
+      { expiresIn: "24h" }
+    );
+
+    // id_token OIDC
+    const idToken = jwt.sign(
+      {
+        iss: "https://id.neat.qzz.io",
+        sub: appUser._id.toString(),
+        aud: clientId,
+        iat: Math.floor(Date.now() / 1000),
+        exp: Math.floor(Date.now() / 1000) + 86400,
+        email: appUser.email,
+        username: appUser.username,
+        neat_user: !!appUser.neatUserId,
+        neat_user_id: appUser.neatUserId || undefined,
+      },
+      SECRET,
+      { algorithm: "HS256" }
+    );
+
+    // Guardar sesión
+    await database.collection("id_app_sessions").insertOne({
+      token: accessToken,
+      appSlug: oauthCode.appSlug,
+      clientId,
+      userId: appUser._id.toString(),
+      createdAt: new Date(),
+      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000)
+    });
+
+    res.json({
+      access_token: accessToken,
+      id_token: idToken,
+      token_type: "Bearer",
+      expires_in: 86400,
+      scope: "openid profile email"
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── 12. USERINFO DEL TENANT ───────────────────────────────────────────────────
+// GET /id/userinfo
+// El dev llama esto con el access_token de /id/token para obtener datos del usuario.
+// Valida que el token es de tipo "id_app".
+app.get("/id/userinfo", async (req, res) => {
+  try {
+    const header = req.headers.authorization;
+    if (!header) return res.status(401).json({ error: "Authorization requerido" });
+
+    let payload;
+    try {
+      payload = jwt.verify(header.replace("Bearer ", ""), SECRET);
+    } catch {
+      return res.status(401).json({ error: "Token inválido" });
+    }
+
+    if (payload.type !== "id_app")
+      return res.status(403).json({ error: "Token no es de Neat ID Apps" });
+
+    const database = await getDb();
+    const user = await database.collection("id_app_users")
+      .findOne({ _id: new ObjectId(payload.sub) });
+    if (!user) return res.status(404).json({ error: "Usuario no encontrado" });
+
+    res.json({
+      sub: user._id.toString(),
+      username: user.username,
+      email: user.email,
+      appSlug: user.appSlug,
+      isNeatUser: !!user.neatUserId,
+      neatUserId: user.neatUserId || null,
+      verified: !!user.verified,
+      createdAt: user.createdAt
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── 13. VINCULAR CUENTA NEAT A USUARIO LOCAL ──────────────────────────────────
+// POST /id/users/:slug/link-neat
+// Un usuario que entró con email+pass local puede vincular su cuenta Neat.
+// Después podrá entrar con ambos métodos.
+// El dev redirige al usuario a neat.qzz.io/oauth con el scope "openid profile email"
+// usando el internalClientId, y cuando vuelve llama este endpoint.
+app.post("/id/users/:slug/link-neat", async (req, res) => {
+  try {
+    const { neatCode, localAccessToken, redirectUri, codeVerifier } = req.body;
+    if (!neatCode || !localAccessToken || !codeVerifier)
+      return res.status(400).json({ error: "neatCode, localAccessToken y codeVerifier requeridos" });
+
+    // Verificar el token local del usuario
+    let localPayload;
+    try {
+      localPayload = jwt.verify(localAccessToken, SECRET);
+    } catch {
+      return res.status(401).json({ error: "Token local inválido" });
+    }
+    if (localPayload.type !== "id_app" || localPayload.appSlug !== req.params.slug)
+      return res.status(401).json({ error: "Token no corresponde a esta app" });
+
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app) return res.status(404).json({ error: "App no encontrada" });
+
+    // Intercambiar neatCode → token Neat usando el internalClientId (PKCE)
+    const tokenRes = await fetch("https://neat-apps-b.vercel.app/oauth/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        code: neatCode,
+        client_id: app.internalClientId,
+        redirect_uri: redirectUri || "https://id.neat.qzz.io/id/callback",
+        code_verifier: codeVerifier,
+        grant_type: "authorization_code"
+      })
+    });
+    const tokenData = await tokenRes.json();
+    if (!tokenData.access_token) return res.status(400).json({ error: "Código Neat inválido" });
+
+    // Obtener perfil Neat
+    const userRes = await fetch("https://neat-apps-b.vercel.app/oauth/userinfo", {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` }
+    });
+    const neatUser = await userRes.json();
+    if (!neatUser.sub) return res.status(400).json({ error: "Error obteniendo perfil Neat" });
+
+    // Verificar que ese Neat ID no esté ya vinculado a otro usuario en esta app
+    const alreadyLinked = await database.collection("id_app_users").findOne({
+      appSlug: req.params.slug,
+      neatUserId: neatUser.sub,
+      _id: { $ne: new ObjectId(localPayload.sub) }
+    });
+    if (alreadyLinked) return res.status(409).json({ error: "Esa cuenta Neat ya está vinculada a otro usuario en esta app" });
+
+    // Vincular
+    await database.collection("id_app_users").updateOne(
+      { _id: new ObjectId(localPayload.sub) },
+      { $set: { neatUserId: neatUser.sub, lastNeatSync: new Date() } }
+    );
+
+    res.json({ ok: true, neatUserId: neatUser.sub, neatUsername: neatUser.username });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── 14. DESVINCULAR CUENTA NEAT ───────────────────────────────────────────────
+// DELETE /id/users/:slug/link-neat
+// Solo si el usuario tiene password local (si no, no puede desvincular o quedaría sin acceso)
+app.delete("/id/users/:slug/link-neat", async (req, res) => {
+  try {
+    const header = req.headers.authorization;
+    let payload;
+    try {
+      payload = jwt.verify(header?.replace("Bearer ", ""), SECRET);
+    } catch {
+      return res.status(401).json({ error: "Token inválido" });
+    }
+    if (payload.type !== "id_app" || payload.appSlug !== req.params.slug)
+      return res.status(403).json({ error: "Token no corresponde a esta app" });
+
+    const database = await getDb();
+    const user = await database.collection("id_app_users")
+      .findOne({ _id: new ObjectId(payload.sub) });
+    if (!user) return res.status(404).json({ error: "Usuario no encontrado" });
+    if (!user.passwordHash)
+      return res.status(400).json({ error: "No puedes desvincular Neat si no tienes contraseña local. Crea una primero." });
+
+    await database.collection("id_app_users").updateOne(
+      { _id: new ObjectId(payload.sub) },
+      { $set: { neatUserId: null } }
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── 15. GESTIÓN DE USUARIOS DEL TENANT (para el dev) ─────────────────────────
+// GET /id/apps/:slug/users
+// El dev ve sus usuarios. Autenticado con x-client-id + x-client-secret.
+app.get("/id/apps/:slug/users", tenantAuth, async (req, res) => {
+  try {
+    if (req.idApp.slug !== req.params.slug)
+      return res.status(403).json({ error: "Credenciales no corresponden a esta app" });
+
+    const database = await getDb();
+    const { limit = 50, skip = 0, q } = req.query;
+    const filter = { appSlug: req.params.slug };
+    if (q) {
+      const re = new RegExp(q.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [{ email: re }, { username: re }];
+    }
+
+    const users = await database.collection("id_app_users")
+      .find(filter, { projection: { passwordHash: 0 } })
+      .sort({ createdAt: -1 })
+      .skip(parseInt(skip))
+      .limit(parseInt(limit))
+      .toArray();
+
+    const total = await database.collection("id_app_users").countDocuments(filter);
+    res.json({ users, total, limit: parseInt(limit), skip: parseInt(skip) });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── 16. DETALLE DE USUARIO DEL TENANT ────────────────────────────────────────
+// GET /id/apps/:slug/users/:userId
+app.get("/id/apps/:slug/users/:userId", tenantAuth, async (req, res) => {
+  try {
+    if (req.idApp.slug !== req.params.slug)
+      return res.status(403).json({ error: "Credenciales no corresponden a esta app" });
+
+    const database = await getDb();
+    const user = await database.collection("id_app_users")
+      .findOne({ _id: new ObjectId(req.params.userId), appSlug: req.params.slug },
+        { projection: { passwordHash: 0 } });
+    if (!user) return res.status(404).json({ error: "Usuario no encontrado" });
+    res.json(user);
+  } catch {
+    res.status(400).json({ error: "ID inválido" });
+  }
+});
+
+// ── 17. SUSPENDER/REACTIVAR USUARIO DEL TENANT ───────────────────────────────
+// PUT /id/apps/:slug/users/:userId/suspend
+app.put("/id/apps/:slug/users/:userId/suspend", tenantAuth, async (req, res) => {
+  try {
+    if (req.idApp.slug !== req.params.slug)
+      return res.status(403).json({ error: "Credenciales no corresponden a esta app" });
+
+    const { suspended, reason } = req.body;
+    const database = await getDb();
+    await database.collection("id_app_users").updateOne(
+      { _id: new ObjectId(req.params.userId), appSlug: req.params.slug },
+      { $set: { suspended: !!suspended, suspendedReason: reason || null } }
+    );
+    // Revocar sesiones activas si se suspende
+    if (suspended) {
+      await database.collection("id_app_sessions").deleteMany({
+        userId: req.params.userId, appSlug: req.params.slug
+      });
+    }
+    res.json({ ok: true, suspended: !!suspended });
+  } catch {
+    res.status(400).json({ error: "ID inválido" });
+  }
+});
+
+// ── 18. ELIMINAR USUARIO DEL TENANT ──────────────────────────────────────────
+// DELETE /id/apps/:slug/users/:userId
+app.delete("/id/apps/:slug/users/:userId", tenantAuth, async (req, res) => {
+  try {
+    if (req.idApp.slug !== req.params.slug)
+      return res.status(403).json({ error: "Credenciales no corresponden a esta app" });
+
+    const database = await getDb();
+    await database.collection("id_app_users").deleteOne(
+      { _id: new ObjectId(req.params.userId), appSlug: req.params.slug }
+    );
+    await database.collection("id_app_sessions").deleteMany(
+      { userId: req.params.userId, appSlug: req.params.slug }
+    );
+    res.json({ ok: true });
+  } catch {
+    res.status(400).json({ error: "ID inválido" });
+  }
+});
+
+// ── 19. ESTADÍSTICAS DEL TENANT ───────────────────────────────────────────────
+// GET /id/apps/:slug/stats
+app.get("/id/apps/:slug/stats", tenantAuth, async (req, res) => {
+  try {
+    if (req.idApp.slug !== req.params.slug)
+      return res.status(403).json({ error: "Credenciales no corresponden a esta app" });
+
+    const database = await getDb();
+    const slug = req.params.slug;
+
+    const [totalUsers, neatUsers, localUsers, activeSessions, recentUsers] = await Promise.all([
+      database.collection("id_app_users").countDocuments({ appSlug: slug }),
+      database.collection("id_app_users").countDocuments({ appSlug: slug, neatUserId: { $ne: null } }),
+      database.collection("id_app_users").countDocuments({ appSlug: slug, neatUserId: null }),
+      database.collection("id_app_sessions").countDocuments({ appSlug: slug, expiresAt: { $gt: new Date() } }),
+      database.collection("id_app_users")
+        .find({ appSlug: slug }, { projection: { passwordHash: 0 } })
+        .sort({ createdAt: -1 }).limit(5).toArray()
+    ]);
+
+    res.json({ totalUsers, neatUsers, localUsers, activeSessions, recentUsers });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── 20. REVOCAR TOKEN DE USUARIO (del tenant) ─────────────────────────────────
+// POST /id/apps/:slug/revoke
+// El dev puede revocar el token de un usuario (logout forzado).
+app.post("/id/apps/:slug/revoke", tenantAuth, async (req, res) => {
+  try {
+    if (req.idApp.slug !== req.params.slug)
+      return res.status(403).json({ error: "Credenciales no corresponden a esta app" });
+
+    const { token, userId } = req.body;
+    if (!token && !userId) return res.status(400).json({ error: "token o userId requerido" });
+
+    const database = await getDb();
+    const filter = { appSlug: req.params.slug };
+    if (token) filter.token = token;
+    if (userId) filter.userId = userId;
+
+    await database.collection("id_app_sessions").deleteMany(filter);
+    res.json({ ok: true });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── 21. ADMIN — LISTAR TODAS LAS APPS ────────────────────────────────────────
+// GET /id/apps (solo admin)
+app.get("/id/apps", adminAuth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const apps = await database.collection("id_apps")
+      .find({}, { projection: { "tenantClient.clientSecret": 0 } })
+      .sort({ createdAt: -1 }).toArray();
+    res.json(apps);
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── 22. ADMIN — SUSPENDER APP ─────────────────────────────────────────────────
+// PUT /id/apps/:slug/suspend (solo admin)
+app.put("/id/apps/:slug/suspend", adminAuth, async (req, res) => {
+  try {
+    const { suspended, reason } = req.body;
+    const database = await getDb();
+    await database.collection("id_apps").updateOne(
+      { slug: req.params.slug },
+      { $set: { suspended: !!suspended, suspendedReason: reason || null } }
+    );
+    res.json({ ok: true, suspended: !!suspended });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── 23. OPENID CONFIGURATION DE NEAT ID APPS ─────────────────────────────────
+// GET /id/.well-known/openid-configuration
+// Separado del OIDC de Neat global. Apunta a los endpoints /id/
+app.get("/id/.well-known/openid-configuration", (req, res) => {
+  const base = "https://id.neat.qzz.io";
+  res.json({
+    issuer: base,
+    authorization_endpoint: `${base}/login`,           // hosted login page (frontend)
+    token_endpoint: `${base}/id/token`,
+    userinfo_endpoint: `${base}/id/userinfo`,
+    jwks_uri: `${base}/id/.well-known/jwks.json`,
+    scopes_supported: ["openid", "profile", "email"],
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code"],
+    token_endpoint_auth_methods_supported: ["client_secret_post", "none"],
+    subject_types_supported: ["public"],
+    id_token_signing_alg_values_supported: ["HS256"],
+    claims_supported: ["sub", "username", "email", "neat_user", "neat_user_id"]
+  });
+});
+
+app.get("/id/.well-known/jwks.json", (req, res) => {
+  res.json({ keys: [] });
+});
+
 // ── Apps (público — sin cambios para Neat Astore) ─────────────────────────────
 app.get("/apps", async (req, res) => {
   const database = await getDb();
