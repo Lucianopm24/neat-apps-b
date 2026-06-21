@@ -3575,13 +3575,16 @@ app.get("/id/apps/me", auth, requireAuth, async (req, res) => {
 
 // ── 3. INFO PÚBLICA DE UNA APP (para la hosted login page) ───────────────────
 // GET /id/apps/:slug/public
-// Sin auth — la hosted login page carga esto para saber nombre, logo, colores
+// Sin auth — la hosted login page carga esto para saber nombre, logo, colores.
+// internalClientId SÍ se expone (a diferencia de antes): es el client_id PKCE
+// público que la hosted page necesita para armar el botón "Continuar con Neat".
+// No es sensible — es público por diseño (igual que cualquier OAuth client_id).
 app.get("/id/apps/:slug/public", async (req, res) => {
   try {
     const database = await getDb();
     const app = await database.collection("id_apps").findOne(
       { slug: req.params.slug },
-      { projection: { tenantClient: 0, internalClientId: 0 } }
+      { projection: { tenantClient: 0 } }
     );
     if (!app) return res.status(404).json({ error: "App no encontrada" });
     if (app.suspended) return res.status(403).json({ error: "App suspendida" });
@@ -3773,7 +3776,7 @@ app.post("/id/users/:slug/login", async (req, res) => {
     if (!app.redirectUris.includes(finalRedirectUri))
       return res.status(400).json({ error: "redirect_uri no autorizada" });
 
-    // Generar code OAuth2 — referencia al usuario local
+    // Generar code OAuth2 — referencia al usuario local (esto es lo que se entrega al tenant)
     const code = crypto.randomBytes(32).toString("hex");
     await database.collection("oauth_codes").insertOne({
       code,
@@ -3791,7 +3794,16 @@ app.post("/id/users/:slug/login", async (req, res) => {
       type: "id_app_local"   // distingue de los codes Neat globales
     });
 
-    res.json({ code, redirectUri: finalRedirectUri, state: state || null });
+    // pageSessionToken — token corto (10 min), SOLO para que la hosted page
+    // pueda llamar /id/users/:slug/link-neat en el mismo flujo, sin tocar el
+    // code/credenciales del tenant. Nunca se le entrega al tenant.
+    const pageSessionToken = jwt.sign(
+      { type: "id_app_page_session", appSlug: req.params.slug, idAppUserId: user._id.toString() },
+      SECRET,
+      { expiresIn: "10m" }
+    );
+
+    res.json({ code, redirectUri: finalRedirectUri, state: state || null, pageSessionToken });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Error interno" });
@@ -4078,15 +4090,23 @@ app.post("/id/users/:slug/link-neat", async (req, res) => {
     if (!neatCode || !localAccessToken || !codeVerifier)
       return res.status(400).json({ error: "neatCode, localAccessToken y codeVerifier requeridos" });
 
-    // Verificar el token local del usuario
+    // Acepta dos tipos de token:
+    //  - "id_app": sesión real emitida por /id/token (el dev la usa desde su backend/app)
+    //  - "id_app_page_session": token corto (10 min) emitido por /id/users/:slug/login,
+    //    usado SOLO por la hosted login page para vincular Neat en el mismo flujo,
+    //    sin que el code/credenciales del tenant entren en juego.
     let localPayload;
     try {
       localPayload = jwt.verify(localAccessToken, SECRET);
     } catch {
       return res.status(401).json({ error: "Token local inválido" });
     }
-    if (localPayload.type !== "id_app" || localPayload.appSlug !== req.params.slug)
+    const validTypes = ["id_app", "id_app_page_session"];
+    if (!validTypes.includes(localPayload.type) || localPayload.appSlug !== req.params.slug)
       return res.status(401).json({ error: "Token no corresponde a esta app" });
+
+    // Normalizamos el id de usuario local según el tipo de token
+    const localUserId = localPayload.type === "id_app" ? localPayload.sub : localPayload.idAppUserId;
 
     const database = await getDb();
     const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
@@ -4118,13 +4138,13 @@ app.post("/id/users/:slug/link-neat", async (req, res) => {
     const alreadyLinked = await database.collection("id_app_users").findOne({
       appSlug: req.params.slug,
       neatUserId: neatUser.sub,
-      _id: { $ne: new ObjectId(localPayload.sub) }
+      _id: { $ne: new ObjectId(localUserId) }
     });
     if (alreadyLinked) return res.status(409).json({ error: "Esa cuenta Neat ya está vinculada a otro usuario en esta app" });
 
     // Vincular
     await database.collection("id_app_users").updateOne(
-      { _id: new ObjectId(localPayload.sub) },
+      { _id: new ObjectId(localUserId) },
       { $set: { neatUserId: neatUser.sub, lastNeatSync: new Date() } }
     );
 
