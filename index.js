@@ -3428,8 +3428,30 @@ function generateAppSlug(name) {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 30);
 }
 
-// Middleware: verifica que el request viene de la app registrada
-// usando client_id + client_secret del tenant
+// Crea un client OAuth interno de una app (id_app_clients) — esto es lo que
+// permite que App X tenga varios clients propios (web, móvil, admin panel...)
+// todos autenticando contra el mismo pool de usuarios de App X (id_app_users).
+// isPublic=true → PKCE, sin secret. isPublic=false → confidential, con secret.
+async function createIdAppClient(database, { appSlug, name, redirectUris, isPublic, isDefault }) {
+  const client = {
+    appSlug,
+    clientId: generateClientId(),
+    clientSecret: isPublic ? null : generateClientSecret(),
+    name: name || (isDefault ? "Default" : "Client"),
+    redirectUris,
+    isPublic: !!isPublic,
+    isDefault: !!isDefault,
+    suspended: false,
+    createdAt: new Date()
+  };
+  await database.collection("id_app_clients").insertOne(client);
+  return client;
+}
+
+// Middleware: verifica que el request viene de un client registrado de la app
+// (cualquiera de los clients en id_app_clients — web, móvil, admin panel, etc),
+// usando client_id + client_secret. Solo clients confidential pueden usar esto
+// (un client PKCE público no tiene secret, no calificaría para gestión admin).
 async function tenantAuth(req, res, next) {
   const clientId = req.headers["x-client-id"] || req.body?.client_id;
   const clientSecret = req.headers["x-client-secret"] || req.body?.client_secret;
@@ -3438,13 +3460,18 @@ async function tenantAuth(req, res, next) {
   }
   try {
     const database = await getDb();
-    const app = await database.collection("id_apps").findOne({
-      "tenantClient.clientId": clientId,
-      "tenantClient.clientSecret": clientSecret
+    const client = await database.collection("id_app_clients").findOne({
+      clientId, clientSecret, isPublic: false
     });
-    if (!app) return res.status(401).json({ error: "Credenciales inválidas" });
+    if (!client) return res.status(401).json({ error: "Credenciales inválidas" });
+    if (client.suspended) return res.status(403).json({ error: "Client suspendido" });
+
+    const app = await database.collection("id_apps").findOne({ slug: client.appSlug });
+    if (!app) return res.status(401).json({ error: "App no encontrada" });
     if (app.suspended) return res.status(403).json({ error: "App suspendida" });
+
     req.idApp = app;
+    req.idAppClient = client;
     next();
   } catch {
     res.status(500).json({ error: "Error interno" });
@@ -3500,42 +3527,34 @@ app.post("/id/apps", auth, requireAuth, async (req, res) => {
     };
     await database.collection("oauth_clients").insertOne(internalClient);
 
-    // Client del tenant — confidential, el dev usa esto en su backend
-    const tenantClient = {
-      clientId: generateClientId(),
-      clientSecret: generateClientSecret(),
-    };
-
     const app = {
       slug,
       name,
       description: description || "",
       homepageUrl: homepageUrl || null,
       ownerUsername: isAdmin ? null : req.user.username,
-      redirectUris,                     // redirect_uris del dev (su app)
+      redirectUris,                     // redirect_uris del dev (su app) — usadas como default
       branding: {
         logoUrl: logoUrl || null,
         primaryColor: primaryColor || "#6366f1",
       },
       internalClientId: internalClient.clientId,  // ref al oauth_client interno
-      tenantClient,                                // credentials del tenant
       suspended: false,
       createdAt: new Date()
     };
 
     await database.collection("id_apps").insertOne(app);
 
-    // También insertar el tenantClient en oauth_clients para que /oauth/token funcione
-    await database.collection("oauth_clients").insertOne({
-      ...tenantClient,
-      name: `${name} (Tenant Client)`,
+    // Client por defecto de la app — vive en id_app_clients (no más tenantClient fijo).
+    // Es confidential (con secret) para mantener compatibilidad con lo que ya
+    // tenías documentado como "tenantClient". El dev puede crear más clients
+    // después vía POST /id/apps/:slug/clients (ej. uno público con PKCE para móvil).
+    const defaultClient = await createIdAppClient(database, {
+      appSlug: slug,
+      name: "Default",
       redirectUris,
-      scopes: ["openid", "profile", "email"],
       isPublic: false,
-      ownerUsername: req.user.username,
-      internal: false,
-      forAppSlug: slug,
-      createdAt: new Date()
+      isDefault: true
     });
 
     res.status(201).json({
@@ -3544,9 +3563,10 @@ app.post("/id/apps", auth, requireAuth, async (req, res) => {
       description: app.description,
       branding: app.branding,
       redirectUris,
-      tenantClient: {
-        clientId: tenantClient.clientId,
-        clientSecret: tenantClient.clientSecret,  // solo se devuelve una vez aquí
+      defaultClient: {
+        clientId: defaultClient.clientId,
+        clientSecret: defaultClient.clientSecret,  // solo se devuelve una vez aquí
+        isPublic: false
       },
       internalClientId: internalClient.clientId,
       loginUrl: `https://id.neat.qzz.io/login?app=${slug}`,
@@ -3565,7 +3585,7 @@ app.get("/id/apps/me", auth, requireAuth, async (req, res) => {
     const database = await getDb();
     const filter = req.user.role === "admin" ? {} : { ownerUsername: req.user.username };
     const apps = await database.collection("id_apps")
-      .find(filter, { projection: { "tenantClient.clientSecret": 0 } })
+      .find(filter)
       .sort({ createdAt: -1 }).toArray();
     res.json(apps);
   } catch {
@@ -3582,10 +3602,7 @@ app.get("/id/apps/me", auth, requireAuth, async (req, res) => {
 app.get("/id/apps/:slug/public", async (req, res) => {
   try {
     const database = await getDb();
-    const app = await database.collection("id_apps").findOne(
-      { slug: req.params.slug },
-      { projection: { tenantClient: 0 } }
-    );
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
     if (!app) return res.status(404).json({ error: "App no encontrada" });
     if (app.suspended) return res.status(403).json({ error: "App suspendida" });
     res.json(app);
@@ -3611,11 +3628,9 @@ app.put("/id/apps/:slug", auth, requireAuth, async (req, res) => {
     if (homepageUrl !== undefined) update.homepageUrl = homepageUrl;
     if (redirectUris?.length) {
       update.redirectUris = redirectUris;
-      // Sincronizar redirect_uris en el oauth_client del tenant
-      await database.collection("oauth_clients").updateOne(
-        { clientId: app.tenantClient.clientId },
-        { $set: { redirectUris } }
-      );
+      // Nota: esto solo actualiza el redirectUris "default" a nivel app.
+      // Cada client en id_app_clients tiene sus propias redirectUris y se
+      // gestionan por separado vía PUT /id/apps/:slug/clients/:clientId.
     }
     if (logoUrl !== undefined) update["branding.logoUrl"] = logoUrl;
     if (primaryColor !== undefined) update["branding.primaryColor"] = primaryColor;
@@ -3627,10 +3642,18 @@ app.put("/id/apps/:slug", auth, requireAuth, async (req, res) => {
   }
 });
 
-// ── 5. ROTAR CLIENT SECRET ────────────────────────────────────────────────────
-// POST /id/apps/:slug/rotate-secret
-// Genera un nuevo clientSecret para el tenant. El anterior deja de funcionar.
-app.post("/id/apps/:slug/rotate-secret", auth, requireAuth, async (req, res) => {
+// ══════════════════════════════════════════════════════════════════════════════
+// CLIENTS INTERNOS DE LA APP (mini-OAuth de App X)
+// App X puede tener varios clients propios — web, móvil, admin panel, etc —
+// cada uno con su client_id/client_secret (o PKCE público) independiente.
+// TODOS autentican contra el mismo pool de usuarios de la app (id_app_users).
+// Gestión por sesión Neat del dueño de la app (igual que el resto del panel).
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── 5a. CREAR CLIENT ──────────────────────────────────────────────────────────
+// POST /id/apps/:slug/clients
+// body: { name, redirectUris, isPublic }
+app.post("/id/apps/:slug/clients", auth, requireAuth, async (req, res) => {
   try {
     const database = await getDb();
     const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
@@ -3638,18 +3661,132 @@ app.post("/id/apps/:slug/rotate-secret", auth, requireAuth, async (req, res) => 
     if (app.ownerUsername !== req.user.username && req.user.role !== "admin")
       return res.status(403).json({ error: "Sin permisos" });
 
+    const { name, redirectUris, isPublic } = req.body;
+    if (!redirectUris?.length)
+      return res.status(400).json({ error: "redirectUris requerido" });
+
+    const client = await createIdAppClient(database, {
+      appSlug: req.params.slug,
+      name: name || "Client",
+      redirectUris,
+      isPublic: !!isPublic,
+      isDefault: false
+    });
+
+    res.status(201).json({
+      clientId: client.clientId,
+      clientSecret: client.clientSecret,  // solo se devuelve una vez aquí (null si isPublic)
+      name: client.name,
+      redirectUris: client.redirectUris,
+      isPublic: client.isPublic,
+      createdAt: client.createdAt
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── 5b. LISTAR CLIENTS ────────────────────────────────────────────────────────
+// GET /id/apps/:slug/clients
+app.get("/id/apps/:slug/clients", auth, requireAuth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app) return res.status(404).json({ error: "App no encontrada" });
+    if (app.ownerUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+
+    const clients = await database.collection("id_app_clients")
+      .find({ appSlug: req.params.slug }, { projection: { clientSecret: 0 } })
+      .sort({ createdAt: 1 }).toArray();
+    res.json(clients);
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── 5c. ACTUALIZAR CLIENT ─────────────────────────────────────────────────────
+// PUT /id/apps/:slug/clients/:clientId
+app.put("/id/apps/:slug/clients/:clientId", auth, requireAuth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app) return res.status(404).json({ error: "App no encontrada" });
+    if (app.ownerUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+
+    const client = await database.collection("id_app_clients")
+      .findOne({ appSlug: req.params.slug, clientId: req.params.clientId });
+    if (!client) return res.status(404).json({ error: "Client no encontrado" });
+
+    const { name, redirectUris, suspended } = req.body;
+    const update = {};
+    if (name) update.name = name;
+    if (redirectUris?.length) update.redirectUris = redirectUris;
+    if (suspended !== undefined) update.suspended = !!suspended;
+
+    await database.collection("id_app_clients").updateOne(
+      { _id: client._id }, { $set: update }
+    );
+    res.json({ ok: true });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── 5d. ROTAR SECRET DE UN CLIENT ─────────────────────────────────────────────
+// POST /id/apps/:slug/clients/:clientId/rotate-secret
+// Solo aplica a clients confidential (isPublic: false). Un client PKCE no tiene secret.
+app.post("/id/apps/:slug/clients/:clientId/rotate-secret", auth, requireAuth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app) return res.status(404).json({ error: "App no encontrada" });
+    if (app.ownerUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+
+    const client = await database.collection("id_app_clients")
+      .findOne({ appSlug: req.params.slug, clientId: req.params.clientId });
+    if (!client) return res.status(404).json({ error: "Client no encontrado" });
+    if (client.isPublic)
+      return res.status(400).json({ error: "Este client usa PKCE, no tiene client_secret que rotar" });
+
     const newSecret = generateClientSecret();
-
-    await database.collection("id_apps").updateOne(
-      { slug: req.params.slug },
-      { $set: { "tenantClient.clientSecret": newSecret } }
-    );
-    await database.collection("oauth_clients").updateOne(
-      { clientId: app.tenantClient.clientId },
-      { $set: { clientSecret: newSecret } }
+    await database.collection("id_app_clients").updateOne(
+      { _id: client._id }, { $set: { clientSecret: newSecret } }
     );
 
-    res.json({ clientId: app.tenantClient.clientId, clientSecret: newSecret });
+    res.json({ clientId: client.clientId, clientSecret: newSecret });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── 5e. ELIMINAR CLIENT ───────────────────────────────────────────────────────
+// DELETE /id/apps/:slug/clients/:clientId
+// No se puede eliminar el último client de la app (siempre debe quedar al menos uno).
+app.delete("/id/apps/:slug/clients/:clientId", auth, requireAuth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app) return res.status(404).json({ error: "App no encontrada" });
+    if (app.ownerUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+
+    const totalClients = await database.collection("id_app_clients")
+      .countDocuments({ appSlug: req.params.slug });
+    if (totalClients <= 1)
+      return res.status(400).json({ error: "No puedes eliminar el único client de la app" });
+
+    const result = await database.collection("id_app_clients")
+      .deleteOne({ appSlug: req.params.slug, clientId: req.params.clientId });
+    if (result.deletedCount === 0) return res.status(404).json({ error: "Client no encontrado" });
+
+    // Las sesiones emitidas por ese client quedan revocadas
+    await database.collection("id_app_sessions").deleteMany({ clientId: req.params.clientId });
+
+    res.json({ ok: true });
   } catch {
     res.status(500).json({ error: "Error interno" });
   }
@@ -3667,7 +3804,8 @@ app.delete("/id/apps/:slug", auth, requireAuth, async (req, res) => {
 
     // Eliminar todo lo relacionado
     await database.collection("id_apps").deleteOne({ slug: req.params.slug });
-    await database.collection("oauth_clients").deleteMany({ forAppSlug: req.params.slug });
+    await database.collection("oauth_clients").deleteOne({ clientId: app.internalClientId });
+    await database.collection("id_app_clients").deleteMany({ appSlug: req.params.slug });
     await database.collection("id_app_users").deleteMany({ appSlug: req.params.slug });
     await database.collection("id_app_sessions").deleteMany({ appSlug: req.params.slug });
 
@@ -3743,7 +3881,7 @@ app.post("/id/users/:slug/register", async (req, res) => {
 // Devuelve un code OAuth2 listo para que Neat lo redirija al tenant.
 app.post("/id/users/:slug/login", async (req, res) => {
   try {
-    const { email, password, internalToken, redirectUri, codeChallenge, codeChallengeMethod, state } = req.body;
+    const { email, password, internalToken, redirectUri, codeChallenge, codeChallengeMethod, state, clientId } = req.body;
 
     let tokenPayload;
     try {
@@ -3761,6 +3899,15 @@ app.post("/id/users/:slug/login", async (req, res) => {
     const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
     if (!app || app.suspended) return res.status(403).json({ error: "App suspendida o no encontrada" });
 
+    // Resolver qué client de la app está pidiendo el login. Si no se especifica
+    // clientId (apps viejas / integraciones simples), usamos el client default
+    // de la app por compatibilidad.
+    const client = clientId
+      ? await database.collection("id_app_clients").findOne({ appSlug: req.params.slug, clientId })
+      : await database.collection("id_app_clients").findOne({ appSlug: req.params.slug, isDefault: true });
+    if (!client) return res.status(400).json({ error: "client_id inválido para esta app" });
+    if (client.suspended) return res.status(403).json({ error: "Client suspendido" });
+
     const user = await database.collection("id_app_users").findOne({
       appSlug: req.params.slug,
       email: email.toLowerCase()
@@ -3771,16 +3918,16 @@ app.post("/id/users/:slug/login", async (req, res) => {
     if (!valid) return res.status(401).json({ error: "Credenciales inválidas" });
     if (user.suspended) return res.status(403).json({ error: "Cuenta suspendida en esta app" });
 
-    // Validar redirect_uri contra las del tenant
-    const finalRedirectUri = redirectUri || app.redirectUris[0];
-    if (!app.redirectUris.includes(finalRedirectUri))
-      return res.status(400).json({ error: "redirect_uri no autorizada" });
+    // Validar redirect_uri contra las del CLIENT específico (no las genéricas de la app)
+    const finalRedirectUri = redirectUri || client.redirectUris[0];
+    if (!client.redirectUris.includes(finalRedirectUri))
+      return res.status(400).json({ error: "redirect_uri no autorizada para este client" });
 
     // Generar code OAuth2 — referencia al usuario local (esto es lo que se entrega al tenant)
     const code = crypto.randomBytes(32).toString("hex");
     await database.collection("oauth_codes").insertOne({
       code,
-      clientId: app.tenantClient.clientId,
+      clientId: client.clientId,
       // username vacío — es usuario local, no Neat global
       username: null,
       idAppUserId: user._id.toString(),
@@ -3796,7 +3943,7 @@ app.post("/id/users/:slug/login", async (req, res) => {
 
     // pageSessionToken — token corto (10 min), SOLO para que la hosted page
     // pueda llamar /id/users/:slug/link-neat en el mismo flujo, sin tocar el
-    // code/credenciales del tenant. Nunca se le entrega al tenant.
+    // code/credenciales del client. Nunca se le entrega al tenant.
     const pageSessionToken = jwt.sign(
       { type: "id_app_page_session", appSlug: req.params.slug, idAppUserId: user._id.toString() },
       SECRET,
@@ -3843,18 +3990,27 @@ app.get("/id/callback", async (req, res) => {
     const { code, state } = req.query;
     if (!code || !state) return res.status(400).send("Parámetros faltantes");
 
-    // state codifica: appSlug + redirectUri + codeChallenge del tenant
+    // state codifica: appSlug + clientId del tenant + redirectUri + codeChallenge
     let stateData;
     try {
       stateData = JSON.parse(Buffer.from(state, "base64url").toString());
     } catch {
       return res.status(400).send("State inválido");
     }
-    const { appSlug, redirectUri, codeChallenge, codeChallengeMethod, tenantState } = stateData;
+    const { appSlug, clientId: tenantClientId, redirectUri, codeChallenge, codeChallengeMethod, tenantState } = stateData;
 
     const database = await getDb();
     const app = await database.collection("id_apps").findOne({ slug: appSlug });
     if (!app) return res.status(404).send("App no encontrada");
+
+    // Resolver el client del tenant que originó este login (default si no se especificó)
+    const client = tenantClientId
+      ? await database.collection("id_app_clients").findOne({ appSlug, clientId: tenantClientId })
+      : await database.collection("id_app_clients").findOne({ appSlug, isDefault: true });
+    if (!client) return res.status(400).send("client_id inválido para esta app");
+    if (client.suspended) return res.status(403).send("Client suspendido");
+    if (!client.redirectUris.includes(redirectUri))
+      return res.status(400).send("redirect_uri no autorizada para este client");
 
     // Intercambiar el code Neat (interno, PKCE) → access_token Neat
     // code_verifier está en stateData (la hosted page lo generó y pasó en state)
@@ -3908,11 +4064,11 @@ app.get("/id/callback", async (req, res) => {
       appUserId = result.insertedId.toString();
     }
 
-    // Emitir code del tenant
+    // Emitir code del tenant — referencia al CLIENT específico que originó el login
     const tenantCode = crypto.randomBytes(32).toString("hex");
     await database.collection("oauth_codes").insertOne({
       code: tenantCode,
-      clientId: app.tenantClient.clientId,
+      clientId: client.clientId,
       username: null,
       idAppUserId: appUserId,
       appSlug,
@@ -3963,15 +4119,18 @@ app.post("/id/token", async (req, res) => {
     if (new Date() > oauthCode.expiresAt) return res.status(400).json({ error: "Código expirado" });
     if (oauthCode.redirectUri !== redirectUri) return res.status(400).json({ error: "redirect_uri no coincide" });
 
-    // Verificar credenciales del tenant (secret o PKCE)
-    const client = await database.collection("oauth_clients").findOne({ clientId });
+    // Verificar credenciales del client (secret confidential o PKCE público)
+    const client = await database.collection("id_app_clients").findOne({ clientId });
     if (!client) return res.status(401).json({ error: "Cliente no encontrado" });
+    if (client.suspended) return res.status(403).json({ error: "Client suspendido" });
 
     if (oauthCode.codeChallenge) {
       if (!codeVerifier) return res.status(400).json({ error: "code_verifier requerido" });
       const hash = crypto.createHash("sha256").update(codeVerifier).digest("base64url");
       if (hash !== oauthCode.codeChallenge) return res.status(401).json({ error: "code_verifier inválido" });
     } else {
+      if (client.isPublic)
+        return res.status(400).json({ error: "Este client es público (PKCE) — falta code_challenge en el code original" });
       if (!clientSecret || client.clientSecret !== clientSecret)
         return res.status(401).json({ error: "client_secret inválido" });
     }
@@ -4335,7 +4494,7 @@ app.get("/id/apps", adminAuth, async (req, res) => {
   try {
     const database = await getDb();
     const apps = await database.collection("id_apps")
-      .find({}, { projection: { "tenantClient.clientSecret": 0 } })
+      .find({})
       .sort({ createdAt: -1 }).toArray();
     res.json(apps);
   } catch {
