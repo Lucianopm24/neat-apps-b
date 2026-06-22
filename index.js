@@ -5891,20 +5891,43 @@ function generatePkcePair() {
 // ── Providers GLOBALES (los configura el dueño de Neat) ──────────────────────
 
 // POST /id/social/global — crear/configurar un provider global. Solo admin.
-// body: { key, name, discoveryUrl, clientId, clientSecret, scope }
+// Modo discovery: { key, name, discoveryUrl, clientId, clientSecret, scope }
+// Modo manual (sin discovery, ej. Discord): { key, name, clientId, clientSecret,
+//   scope, authorizationEndpoint, tokenEndpoint, userinfoEndpoint }
 app.post("/id/social/global", auth, requireAuth, async (req, res) => {
   try {
     if (req.user.role !== "admin") return res.status(403).json({ error: "Solo el admin de Neat puede configurar providers globales" });
 
-    const { key, name, discoveryUrl, clientId, clientSecret, scope } = req.body;
-    if (!key || !name || !discoveryUrl || !clientId)
-      return res.status(400).json({ error: "key, name, discoveryUrl y clientId son requeridos" });
+    const {
+      key, name, discoveryUrl, clientId, clientSecret, scope,
+      authorizationEndpoint, tokenEndpoint, userinfoEndpoint
+    } = req.body;
+    if (!key || !name || !clientId)
+      return res.status(400).json({ error: "key, name y clientId son requeridos" });
 
-    let discovery;
-    try {
-      discovery = await fetchOidcDiscovery(discoveryUrl);
-    } catch (e) {
-      return res.status(400).json({ error: "Discovery URL inválida: " + e.message });
+    let endpoints;
+    if (discoveryUrl) {
+      let discovery;
+      try {
+        discovery = await fetchOidcDiscovery(discoveryUrl);
+      } catch (e) {
+        return res.status(400).json({ error: "Discovery URL inválida: " + e.message });
+      }
+      endpoints = {
+        authorizationEndpoint: discovery.authorization_endpoint,
+        tokenEndpoint: discovery.token_endpoint,
+        userinfoEndpoint: discovery.userinfo_endpoint || null
+      };
+    } else {
+      // Modo manual: el admin da los endpoints directamente (providers que no
+      // exponen .well-known/openid-configuration, ej. Discord, X, etc.)
+      if (!authorizationEndpoint || !tokenEndpoint)
+        return res.status(400).json({ error: "Sin discoveryUrl, authorizationEndpoint y tokenEndpoint son requeridos" });
+      endpoints = {
+        authorizationEndpoint,
+        tokenEndpoint,
+        userinfoEndpoint: userinfoEndpoint || null
+      };
     }
 
     const database = await getDb();
@@ -5912,10 +5935,8 @@ app.post("/id/social/global", auth, requireAuth, async (req, res) => {
       { key },
       {
         $set: {
-          key, name, discoveryUrl,
-          authorizationEndpoint: discovery.authorization_endpoint,
-          tokenEndpoint: discovery.token_endpoint,
-          userinfoEndpoint: discovery.userinfo_endpoint || null,
+          key, name, discoveryUrl: discoveryUrl || null,
+          ...endpoints,
           clientId,
           clientSecret: clientSecret || null,  // confidential si se da, si no actúa como público
           scope: scope || "openid profile email",
@@ -5941,6 +5962,21 @@ app.get("/id/social/global", auth, requireAuth, async (req, res) => {
     const providers = await database.collection("social_providers_global")
       .find({}, { projection: { clientSecret: 0 } }).toArray();
     res.json(providers);
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// PUT /id/social/global/:key — activar/desactivar sin eliminar. Solo admin.
+app.put("/id/social/global/:key", auth, requireAuth, async (req, res) => {
+  try {
+    if (req.user.role !== "admin") return res.status(403).json({ error: "Solo el admin de Neat puede hacer esto" });
+    const { enabled } = req.body;
+    const database = await getDb();
+    const result = await database.collection("social_providers_global")
+      .updateOne({ key: req.params.key }, { $set: { enabled: !!enabled, updatedAt: new Date() } });
+    if (result.matchedCount === 0) return res.status(404).json({ error: "Provider no encontrado" });
+    res.json({ ok: true });
   } catch {
     res.status(500).json({ error: "Error interno" });
   }
