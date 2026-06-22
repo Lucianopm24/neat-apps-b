@@ -5180,6 +5180,86 @@ app.put("/id/apps/:slug/kv/:userId", kvUserAuth, async (req, res) => {
   }
 });
 
+// POST /id/apps/:slug/kv/:userId/items — agrega un item a un array dentro de
+// data, sin tener que mandar el blob completo. Pensado para casos tipo
+// "lista de notas": cada nota se agrega sola, con su propio id generado aquí.
+// body: { field: "notas" (default "items"), item: {...lo que sea} }
+app.post("/id/apps/:slug/kv/:userId/items", kvUserAuth, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.userId))
+      return res.status(400).json({ error: "userId inválido" });
+    if (!req.kvAsBackend && req.kvTargetUserId !== req.params.userId)
+      return res.status(403).json({ error: "Solo puedes escribir tu propio storage" });
+
+    const { field = "items", item } = req.body;
+    if (item === undefined) return res.status(400).json({ error: "item requerido" });
+    if (typeof field !== "string" || !/^[a-zA-Z0-9_]+$/.test(field))
+      return res.status(400).json({ error: "field debe ser alfanumérico (sin espacios ni puntos)" });
+
+    const database = await getDb();
+    const doc = await database.collection("id_app_user_kv").findOne({
+      appSlug: req.params.slug, userId: req.params.userId
+    });
+    const currentData = doc?.data ?? {};
+    const currentArray = Array.isArray(currentData[field]) ? currentData[field] : [];
+
+    const itemId = crypto.randomBytes(8).toString("hex");
+    const newItem = (item && typeof item === "object" && !Array.isArray(item))
+      ? { ...item, id: itemId }
+      : { id: itemId, value: item };
+
+    const newData = { ...currentData, [field]: [...currentArray, newItem] };
+    if (!kvSizeOk(newData))
+      return res.status(413).json({ error: `data excede el límite de ${KV_MAX_BYTES / 1024}KB por usuario` });
+
+    await database.collection("id_app_user_kv").updateOne(
+      { appSlug: req.params.slug, userId: req.params.userId },
+      { $set: { data: newData, updatedAt: new Date() } },
+      { upsert: true }
+    );
+    res.status(201).json({ ok: true, item: newItem, updatedAt: new Date() });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// DELETE /id/apps/:slug/kv/:userId/items/:itemId — quita un item (por su id)
+// de un array dentro de data, sin tener que mandar el blob completo.
+// query: ?field=notas (default "items")
+app.delete("/id/apps/:slug/kv/:userId/items/:itemId", kvUserAuth, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.userId))
+      return res.status(400).json({ error: "userId inválido" });
+    if (!req.kvAsBackend && req.kvTargetUserId !== req.params.userId)
+      return res.status(403).json({ error: "Solo puedes escribir tu propio storage" });
+
+    const field = req.query.field || "items";
+    if (typeof field !== "string" || !/^[a-zA-Z0-9_]+$/.test(field))
+      return res.status(400).json({ error: "field debe ser alfanumérico (sin espacios ni puntos)" });
+
+    const database = await getDb();
+    const doc = await database.collection("id_app_user_kv").findOne({
+      appSlug: req.params.slug, userId: req.params.userId
+    });
+    const currentData = doc?.data ?? {};
+    const currentArray = Array.isArray(currentData[field]) ? currentData[field] : [];
+    const filtered = currentArray.filter(it => it?.id !== req.params.itemId);
+
+    if (filtered.length === currentArray.length)
+      return res.status(404).json({ error: "Item no encontrado" });
+
+    const newData = { ...currentData, [field]: filtered };
+    await database.collection("id_app_user_kv").updateOne(
+      { appSlug: req.params.slug, userId: req.params.userId },
+      { $set: { data: newData, updatedAt: new Date() } },
+      { upsert: true }
+    );
+    res.json({ ok: true, updatedAt: new Date() });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
 // ── KV PÚBLICO DEL TENANT ────────────────────────────────────────────────────
 // GET /id/apps/:slug/public-kv — cualquiera lo lee, sin auth (config/datos
 // compartidos de la app, ej. un leaderboard o ajustes globales).
