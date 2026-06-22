@@ -17,6 +17,39 @@ const ADMIN_PASS = process.env.ADMIN_PASS || "changeme";
 const MONGO_URI = process.env.MONGODB_URI;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const EMAIL_DOMAIN = "neat.qzz.io";
+const GMAIL_USER = process.env.GMAIL_USER || null;   // ej. neatappsmail@gmail.com
+const GMAIL_PASS = process.env.GMAIL_PASS || null;   // contraseña de aplicación de Google
+const NEAT_ID_BASE = process.env.NEAT_ID_BASE || "https://id.neat.qzz.io"; // base pública del servidor
+
+// ── Envío de correo (Gmail SMTP vía nodemailer) ───────────────────────────────
+// Solo disponible si GMAIL_USER y GMAIL_PASS están configurados.
+// Para activarlo: npm install nodemailer y configurar las variables de entorno.
+let _nodemailer = null;
+async function getMailer() {
+  if (!GMAIL_USER || !GMAIL_PASS) return null;
+  if (!_nodemailer) {
+    try { _nodemailer = require("nodemailer"); } catch { return null; }
+  }
+  return _nodemailer.createTransport({
+    service: "gmail",
+    auth: { user: GMAIL_USER, pass: GMAIL_PASS }
+  });
+}
+
+async function sendEmail({ to, subject, html }) {
+  const transporter = await getMailer();
+  if (!transporter) {
+    console.warn("[email] GMAIL_USER/GMAIL_PASS no configurados — correo no enviado:", subject, "→", to);
+    return false;
+  }
+  try {
+    await transporter.sendMail({ from: `"Neat ID" <${GMAIL_USER}>`, to, subject, html });
+    return true;
+  } catch (err) {
+    console.error("[email] Error enviando correo:", err.message);
+    return false;
+  }
+}
 
 let db;
 async function getDb() {
@@ -3595,6 +3628,7 @@ app.post("/id/apps", auth, requireAuth, async (req, res) => {
       internalClientId: internalClient.clientId,  // ref al oauth_client interno
       appKey: generateAppKey(),  // credencial pública — KV storage desde apps sin backend
       suspended: false,
+      requireEmailVerification: false,  // Neat Plus: obliga a los usuarios a verificar su email
       createdAt: new Date()
     };
 
@@ -3675,7 +3709,17 @@ app.get("/id/apps/:slug/public", async (req, res) => {
       if (client && !client.suspended) clientName = client.name;
     }
 
-    res.json({ ...app, clientName });
+    res.json({
+      slug: app.slug,
+      name: app.name,
+      description: app.description,
+      homepageUrl: app.homepageUrl,
+      branding: app.branding,
+      internalClientId: app.internalClientId,
+      appKey: app.appKey,
+      requireEmailVerification: !!app.requireEmailVerification,
+      clientName
+    });
   } catch {
     res.status(500).json({ error: "Error interno" });
   }
@@ -3712,8 +3756,122 @@ app.put("/id/apps/:slug", auth, requireAuth, async (req, res) => {
   }
 });
 
+// ── VERIFICACIÓN DE EMAIL ────────────────────────────────────────────────────
+// GET /id/users/:slug/verify-email?token=...
+// El usuario hace clic en el enlace del correo → marca emailVerified: true
+app.get("/id/users/:slug/verify-email", async (req, res) => {
+  try {
+    const { token } = req.query;
+    if (!token) return res.status(400).send("Token requerido");
+
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app) return res.status(404).send("App no encontrada");
+
+    const user = await database.collection("id_app_users").findOne({
+      appSlug: req.params.slug,
+      emailVerifToken: token
+    });
+    if (!user) return res.status(400).send("Token inválido o ya usado");
+    if (new Date() > new Date(user.emailVerifExpiresAt))
+      return res.status(400).send("El enlace de verificación expiró. Inicia sesión para solicitar uno nuevo.");
+
+    await database.collection("id_app_users").updateOne(
+      { _id: user._id },
+      { $set: { emailVerified: true, emailVerifToken: null, emailVerifExpiresAt: null } }
+    );
+
+    // Redirigir a la página de login de la app con mensaje de éxito
+    res.redirect(`https://id.neat.qzz.io/${req.params.slug}?verified=1`);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Error interno");
+  }
+});
+
+// POST /id/users/:slug/resend-verification
+// El usuario pide un nuevo correo de verificación (token expirado o perdido)
+app.post("/id/users/:slug/resend-verification", async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: "email requerido" });
+
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app || app.suspended) return res.status(404).json({ error: "App no encontrada" });
+    if (!app.requireEmailVerification) return res.status(400).json({ error: "Esta app no requiere verificación" });
+
+    const user = await database.collection("id_app_users").findOne({
+      appSlug: req.params.slug,
+      email: email.toLowerCase()
+    });
+    // Respuesta genérica para no revelar si el email existe
+    if (!user || user.emailVerified || user.email.endsWith("@neat.qzz.io"))
+      return res.json({ ok: true });
+
+    const newToken = crypto.randomBytes(32).toString("hex");
+    const newExpiry = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    await database.collection("id_app_users").updateOne(
+      { _id: user._id },
+      { $set: { emailVerifToken: newToken, emailVerifExpiresAt: newExpiry } }
+    );
+
+    const verifyUrl = `${NEAT_ID_BASE}/id/users/${req.params.slug}/verify-email?token=${newToken}`;
+    await sendEmail({
+      to: user.email,
+      subject: `Verifica tu correo en ${app.name}`,
+      html: `
+        <div style="font-family:sans-serif;max-width:480px;margin:0 auto">
+          <h2 style="color:#1f1f1f">Nuevo enlace de verificación</h2>
+          <p>Hola <strong>${user.username}</strong>, aquí tienes un nuevo enlace para verificar tu correo en <strong>${app.name}</strong>:</p>
+          <a href="${verifyUrl}" style="display:inline-block;margin:16px 0;padding:12px 24px;background:#0b57d0;color:#fff;border-radius:8px;text-decoration:none;font-weight:600">Verificar correo</a>
+          <p style="color:#666;font-size:13px">Este enlace expira en 24 horas.</p>
+        </div>
+      `
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// PUT /id/apps/:slug/require-email-verification
+// Activar/desactivar verificación de email obligatoria (requiere Neat Plus del dueño)
+app.put("/id/apps/:slug/require-email-verification", auth, requireAuth, async (req, res) => {
+  try {
+    const { enabled } = req.body;
+    if (typeof enabled !== "boolean") return res.status(400).json({ error: "enabled (boolean) requerido" });
+
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app) return res.status(404).json({ error: "App no encontrada" });
+    if (app.ownerUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+
+    // Verificar Neat Plus del dueño (el admin siempre puede)
+    if (req.user.role !== "admin" && enabled) {
+      const owner = await database.collection("users").findOne({ username: req.user.username });
+      const plusExpired = owner?.neatPlusExpiresAt && new Date() > new Date(owner.neatPlusExpiresAt);
+      const hasPlus = !plusExpired && !!owner?.neatPlus;
+      if (!hasPlus) return res.status(403).json({ error: "Necesitas Neat Plus para activar la verificación de email obligatoria" });
+    }
+
+    if (!enabled && !process.env.GMAIL_USER)
+      return res.status(400).json({ error: "No hay servidor de correo configurado. Configura GMAIL_USER y GMAIL_PASS primero." });
+
+    await database.collection("id_apps").updateOne(
+      { slug: req.params.slug },
+      { $set: { requireEmailVerification: enabled } }
+    );
+    res.json({ ok: true, requireEmailVerification: enabled });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════════════════════
-// CLIENTS INTERNOS DE LA APP (mini-OAuth de App X)
 // App X puede tener varios clients propios — web, móvil, admin panel, etc —
 // cada uno con su client_id/client_secret (o PKCE público) independiente.
 // TODOS autentican contra el mismo pool de usuarios de la app (id_app_users).
@@ -3928,17 +4086,59 @@ app.post("/id/users/:slug/register", async (req, res) => {
     if (exists) return res.status(409).json({ error: "Email ya registrado en esta app" });
 
     const passwordHash = await bcrypt.hash(password, 10);
+
+    // Determinar estado de verificación inicial según tipo de email
+    // - @neat.qzz.io → se verifica al hacer login con Neat, no por correo
+    // - otro dominio → si el tenant requiere verificación, emitir token y mandar correo
+    const isNeatEmail = email.toLowerCase().endsWith("@neat.qzz.io");
+    let emailVerified = isNeatEmail ? false : true; // emails externos se marcan verificados por defecto salvo que el tenant exija verificación
+    let emailVerifToken = null;
+    let emailVerifExpiresAt = null;
+
+    if (!isNeatEmail && app.requireEmailVerification) {
+      emailVerified = false;
+      emailVerifToken = crypto.randomBytes(32).toString("hex");
+      emailVerifExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
+    }
+
     const result = await database.collection("id_app_users").insertOne({
       appSlug: req.params.slug,
       email: email.toLowerCase(),
       username: username || email.split("@")[0],
       passwordHash,
-      neatUserId: null,         // null = no ha vinculado cuenta Neat
+      neatUserId: null,
+      emailVerified,
+      emailVerifToken,
+      emailVerifExpiresAt,
       suspended: false,
       createdAt: new Date()
     });
 
-    res.status(201).json({ ok: true, userId: result.insertedId });
+    // Mandar correo de verificación si aplica
+    if (!isNeatEmail && app.requireEmailVerification) {
+      const verifyUrl = `${NEAT_ID_BASE}/id/users/${req.params.slug}/verify-email?token=${emailVerifToken}`;
+      await sendEmail({
+        to: email.toLowerCase(),
+        subject: `Verifica tu correo en ${app.name}`,
+        html: `
+          <div style="font-family:sans-serif;max-width:480px;margin:0 auto">
+            <h2 style="color:#1f1f1f">Verifica tu correo</h2>
+            <p>Hola <strong>${username || email.split("@")[0]}</strong>, gracias por registrarte en <strong>${app.name}</strong>.</p>
+            <p>Para poder iniciar sesión, confirma tu correo haciendo clic en el botón:</p>
+            <a href="${verifyUrl}" style="display:inline-block;margin:16px 0;padding:12px 24px;background:#0b57d0;color:#fff;border-radius:8px;text-decoration:none;font-weight:600">Verificar correo</a>
+            <p style="color:#666;font-size:13px">Este enlace expira en 24 horas. Si no te registraste en ${app.name}, ignora este mensaje.</p>
+          </div>
+        `
+      });
+    }
+
+    res.status(201).json({
+      ok: true,
+      userId: result.insertedId,
+      emailVerified,
+      requiresVerification: !emailVerified,
+      verificationMethod: isNeatEmail ? "neat" : "email"
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Error interno" });
@@ -3987,6 +4187,17 @@ app.post("/id/users/:slug/login", async (req, res) => {
     const valid = await bcrypt.compare(password, user.passwordHash);
     if (!valid) return res.status(401).json({ error: "Credenciales inválidas" });
     if (user.suspended) return res.status(403).json({ error: "Cuenta suspendida en esta app" });
+
+    // Bloquear si el tenant requiere verificación y el usuario aún no verificó
+    if (app.requireEmailVerification && !user.emailVerified) {
+      const isNeatEmail = user.email.endsWith("@neat.qzz.io");
+      return res.status(403).json({
+        error: "Email no verificado",
+        requiresVerification: true,
+        verificationMethod: isNeatEmail ? "neat" : "email",
+        email: user.email
+      });
+    }
 
     // Validar redirect_uri contra las del CLIENT específico (no las genéricas de la app)
     const finalRedirectUri = redirectUri || client.redirectUris[0];
@@ -4111,6 +4322,14 @@ app.get("/id/callback", async (req, res) => {
       neatUserId: neatUser.sub
     });
 
+    // También buscar usuario local que tenga email @neat.qzz.io coincidente con este neatUsername
+    // (se registró con ese email antes de vincular su cuenta Neat)
+    const neatEmailMatch = await database.collection("id_app_users").findOne({
+      appSlug,
+      email: `${neatUser.username}@neat.qzz.io`,
+      neatUserId: null  // no vinculado aún
+    });
+
     let appUserId;
     if (existingUser) {
       if (existingUser.suspended)
@@ -4125,9 +4344,31 @@ app.get("/id/callback", async (req, res) => {
       const syncFields = existingUser.passwordHash
         ? { lastNeatSync: new Date() }
         : { email: neatUser.email || existingUser.email, username: neatUser.username, lastNeatSync: new Date() };
+      // Si este usuario tenía email @neat.qzz.io sin verificar, lo marcamos verificado ahora
+      if (!existingUser.emailVerified && existingUser.email.endsWith("@neat.qzz.io")) {
+        syncFields.emailVerified = true;
+        syncFields.emailVerifToken = null;
+        syncFields.emailVerifExpiresAt = null;
+      }
       await database.collection("id_app_users").updateOne(
         { _id: existingUser._id },
         { $set: syncFields }
+      );
+    } else if (neatEmailMatch) {
+      // Usuario que se registró con su @neat.qzz.io antes de vincular Neat:
+      // vinculamos su cuenta y la marcamos verificada
+      if (neatEmailMatch.suspended)
+        return res.redirect(`${redirectUri}?error=access_denied&error_description=${encodeURIComponent("Tu cuenta de esta app está suspendida.")}`);
+      appUserId = neatEmailMatch._id.toString();
+      await database.collection("id_app_users").updateOne(
+        { _id: neatEmailMatch._id },
+        { $set: {
+          neatUserId: neatUser.sub,
+          emailVerified: true,
+          emailVerifToken: null,
+          emailVerifExpiresAt: null,
+          lastNeatSync: new Date()
+        }}
       );
     } else {
       // Primer login con Neat en esta app → crear usuario local vinculado
@@ -4137,11 +4378,19 @@ app.get("/id/callback", async (req, res) => {
         username: neatUser.username,
         passwordHash: null,       // no tiene password local, entra solo con Neat
         neatUserId: neatUser.sub, // vinculado
+        emailVerified: true,      // entrar con Neat es prueba suficiente de identidad
         verified: !!neatUser.verified,
         suspended: false,
         createdAt: new Date()
       });
       appUserId = result.insertedId.toString();
+    }
+
+    // Si el tenant requiere verificación, verificar que el usuario ya está verificado
+    // (puede ocurrir si existingUser aún no verificó y su email no es @neat.qzz.io)
+    const finalUser = await database.collection("id_app_users").findOne({ _id: new ObjectId(appUserId) });
+    if (app.requireEmailVerification && !finalUser.emailVerified) {
+      return res.redirect(`${redirectUri}?error=access_denied&error_description=${encodeURIComponent("Debes verificar tu correo electrónico antes de iniciar sesión.")}`);
     }
 
     // Emitir code del tenant — referencia al CLIENT específico que originó el login
@@ -4446,13 +4695,39 @@ app.post("/id/users/:slug/manage/login-with-neat", async (req, res) => {
     const neatUser = await userRes.json();
     if (!neatUser.sub) return res.status(400).json({ error: "Error obteniendo perfil Neat" });
 
-    const user = await database.collection("id_app_users").findOne({
+    let user = await database.collection("id_app_users").findOne({
       appSlug: req.params.slug,
       neatUserId: neatUser.sub
     });
+
+    // Si no hay usuario vinculado, buscar por email @neat.qzz.io coincidente
+    if (!user) {
+      const neatEmailMatch = await database.collection("id_app_users").findOne({
+        appSlug: req.params.slug,
+        email: `${neatUser.username}@neat.qzz.io`,
+        neatUserId: null
+      });
+      if (neatEmailMatch) {
+        // Vincular y marcar verificado
+        await database.collection("id_app_users").updateOne(
+          { _id: neatEmailMatch._id },
+          { $set: { neatUserId: neatUser.sub, emailVerified: true, emailVerifToken: null, emailVerifExpiresAt: null, lastNeatSync: new Date() } }
+        );
+        user = { ...neatEmailMatch, neatUserId: neatUser.sub, emailVerified: true };
+      }
+    }
+
     if (!user)
       return res.status(404).json({ error: "No hay cuenta vinculada a este Neat en esta app. Inicia sesión primero con 'Continuar con Neat' desde el login normal." });
     if (user.suspended) return res.status(403).json({ error: "Cuenta suspendida en esta app" });
+
+    // Marcar emailVerified si es @neat.qzz.io y no estaba verificado
+    if (!user.emailVerified && user.email.endsWith("@neat.qzz.io")) {
+      await database.collection("id_app_users").updateOne(
+        { _id: user._id },
+        { $set: { emailVerified: true, emailVerifToken: null, emailVerifExpiresAt: null } }
+      );
+    }
 
     const sessionToken = generateManageSessionToken(req.params.slug, user._id.toString());
     res.json({ access_token: sessionToken, expires_in: 1800 });
