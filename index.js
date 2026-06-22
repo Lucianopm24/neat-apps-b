@@ -4149,6 +4149,40 @@ app.post("/id/users/:slug/register", async (req, res) => {
 // POST /id/users/:slug/login
 // La hosted login page llama esto para autenticar al usuario local.
 // Devuelve un code OAuth2 listo para que Neat lo redirija al tenant.
+// Genera el code OAuth2 local (id_app_local) + pageSessionToken para un usuario
+// ya autenticado. Se usa tanto en login directo (sin 2FA) como después de
+// verificar el código TOTP (login con 2FA).
+async function issueLocalOAuthCode(database, { user, appSlug, client, redirectUri, codeChallenge, codeChallengeMethod, state }) {
+  const finalRedirectUri = redirectUri || client.redirectUris[0];
+  if (!client.redirectUris.includes(finalRedirectUri)) {
+    return { error: "redirect_uri no autorizada para este client" };
+  }
+
+  const code = crypto.randomBytes(32).toString("hex");
+  await database.collection("oauth_codes").insertOne({
+    code,
+    clientId: client.clientId,
+    username: null,
+    idAppUserId: user._id.toString(),
+    appSlug,
+    redirectUri: finalRedirectUri,
+    scopes: ["openid", "profile", "email"],
+    codeChallenge: codeChallenge || null,
+    codeChallengeMethod: codeChallengeMethod || "S256",
+    expiresAt: new Date(Date.now() + 5 * 60 * 1000),
+    used: false,
+    type: "id_app_local"
+  });
+
+  const pageSessionToken = jwt.sign(
+    { type: "id_app_page_session", appSlug, idAppUserId: user._id.toString() },
+    SECRET,
+    { expiresIn: "10m" }
+  );
+
+  return { code, redirectUri: finalRedirectUri, state: state || null, pageSessionToken };
+}
+
 app.post("/id/users/:slug/login", async (req, res) => {
   try {
     const { email, password, internalToken, redirectUri, codeChallenge, codeChallengeMethod, state, clientId } = req.body;
@@ -4199,39 +4233,35 @@ app.post("/id/users/:slug/login", async (req, res) => {
       });
     }
 
-    // Validar redirect_uri contra las del CLIENT específico (no las genéricas de la app)
-    const finalRedirectUri = redirectUri || client.redirectUris[0];
-    if (!client.redirectUris.includes(finalRedirectUri))
-      return res.status(400).json({ error: "redirect_uri no autorizada para este client" });
+    // Si el usuario tiene 2FA activado, no emitimos el code todavía — devolvemos
+    // un totp_pending_token con todos los datos OAuth guardados adentro, para
+    // poder terminar el login después de verificar el código TOTP.
+    if (user.totpEnabled) {
+      const pendingToken = jwt.sign(
+        {
+          type: "totp_pending",
+          appSlug: req.params.slug,
+          sub: user._id.toString(),
+          tokenType: "oauth_code",
+          oauth: {
+            clientId: client.clientId,
+            redirectUri: redirectUri || null,
+            codeChallenge: codeChallenge || null,
+            codeChallengeMethod: codeChallengeMethod || "S256",
+            state: state || null
+          }
+        },
+        SECRET,
+        { expiresIn: "5m" }
+      );
+      return res.json({ totp_required: true, totp_pending_token: pendingToken });
+    }
 
-    // Generar code OAuth2 — referencia al usuario local (esto es lo que se entrega al tenant)
-    const code = crypto.randomBytes(32).toString("hex");
-    await database.collection("oauth_codes").insertOne({
-      code,
-      clientId: client.clientId,
-      // username vacío — es usuario local, no Neat global
-      username: null,
-      idAppUserId: user._id.toString(),
-      appSlug: req.params.slug,
-      redirectUri: finalRedirectUri,
-      scopes: ["openid", "profile", "email"],
-      codeChallenge: codeChallenge || null,
-      codeChallengeMethod: codeChallengeMethod || "S256",
-      expiresAt: new Date(Date.now() + 5 * 60 * 1000),
-      used: false,
-      type: "id_app_local"   // distingue de los codes Neat globales
+    const result = await issueLocalOAuthCode(database, {
+      user, appSlug: req.params.slug, client, redirectUri, codeChallenge, codeChallengeMethod, state
     });
-
-    // pageSessionToken — token corto (10 min), SOLO para que la hosted page
-    // pueda llamar /id/users/:slug/link-neat en el mismo flujo, sin tocar el
-    // code/credenciales del client. Nunca se le entrega al tenant.
-    const pageSessionToken = jwt.sign(
-      { type: "id_app_page_session", appSlug: req.params.slug, idAppUserId: user._id.toString() },
-      SECRET,
-      { expiresIn: "10m" }
-    );
-
-    res.json({ code, redirectUri: finalRedirectUri, state: state || null, pageSessionToken });
+    if (result.error) return res.status(400).json({ error: result.error });
+    res.json(result);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Error interno" });
@@ -4728,8 +4758,7 @@ app.post("/id/users/:slug/manage/login-with-neat", async (req, res) => {
       );
     }
 
-    const sessionToken = generateManageSessionToken(req.params.slug, user._id.toString());
-    res.json({ access_token: sessionToken, expires_in: 1800 });
+    return emitTokenOrRequire2fa(user, req.params.slug, res);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Error interno" });
@@ -5781,6 +5810,27 @@ app.post("/id/users/:slug/manage/2fa/totp", async (req, res) => {
       await database.collection("id_app_users").updateOne(
         { _id: user._id }, { $set: { totpBackupCodes: newBackups } }
       );
+    }
+
+    // Según qué inició el flujo de 2FA, emitimos lo que corresponde:
+    // - "manage_session" → sesión del panel /manage del dueño del tenant
+    // - "oauth_code" → code OAuth2 para el login normal de un usuario final
+    if (payload.tokenType === "oauth_code") {
+      const oauth = payload.oauth || {};
+      const client = await database.collection("id_app_clients").findOne({
+        appSlug: req.params.slug, clientId: oauth.clientId
+      });
+      if (!client || client.suspended) return res.status(400).json({ error: "Client inválido o suspendido" });
+
+      const result = await issueLocalOAuthCode(database, {
+        user, appSlug: req.params.slug, client,
+        redirectUri: oauth.redirectUri,
+        codeChallenge: oauth.codeChallenge,
+        codeChallengeMethod: oauth.codeChallengeMethod,
+        state: oauth.state
+      });
+      if (result.error) return res.status(400).json({ error: result.error });
+      return res.json(result);
     }
 
     const sessionToken = generateManageSessionToken(req.params.slug, user._id.toString());
