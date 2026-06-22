@@ -4407,6 +4407,62 @@ app.post("/id/users/:slug/manage/login", async (req, res) => {
 });
 
 // GET /id/users/:slug/manage/me — equivalente a /userinfo pero para manage_session
+// POST /id/users/:slug/manage/login-with-neat
+// Segunda puerta de entrada al panel, para cuentas 100% Neat que NUNCA
+// tuvieron password local — /manage/login (email+pass) las rechaza a propósito,
+// así que necesitan entrar identificándose con su cuenta Neat en vez de una
+// contraseña que nunca existió. Reusa el mismo intercambio que link-neat
+// (neatCode + internalClientId + PKCE contra Neat global), pero en vez de
+// vincular a un usuario YA logueado, busca quién es por neatUserId y le
+// emite directamente su manage_session — sigue sin existir ningún
+// client_id/secret propio de id_app_clients en este camino.
+app.post("/id/users/:slug/manage/login-with-neat", async (req, res) => {
+  try {
+    const { neatCode, redirectUri, codeVerifier } = req.body;
+    if (!neatCode || !codeVerifier)
+      return res.status(400).json({ error: "neatCode y codeVerifier requeridos" });
+
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app || app.suspended) return res.status(403).json({ error: "App suspendida o no encontrada" });
+
+    const tokenRes = await fetch("https://neat-apps-b.vercel.app/oauth/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        code: neatCode,
+        client_id: app.internalClientId,
+        redirect_uri: redirectUri || "https://neat-apps-b.vercel.app/id/callback",
+        code_verifier: codeVerifier,
+        grant_type: "authorization_code"
+      })
+    });
+    const tokenData = await tokenRes.json();
+    if (!tokenData.access_token) return res.status(400).json({ error: "Código Neat inválido" });
+
+    const userRes = await fetch("https://neat-apps-b.vercel.app/oauth/userinfo", {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` }
+    });
+    const neatUser = await userRes.json();
+    if (!neatUser.sub) return res.status(400).json({ error: "Error obteniendo perfil Neat" });
+
+    const user = await database.collection("id_app_users").findOne({
+      appSlug: req.params.slug,
+      neatUserId: neatUser.sub
+    });
+    if (!user)
+      return res.status(404).json({ error: "No hay cuenta vinculada a este Neat en esta app. Inicia sesión primero con 'Continuar con Neat' desde el login normal." });
+    if (user.suspended) return res.status(403).json({ error: "Cuenta suspendida en esta app" });
+
+    const sessionToken = generateManageSessionToken(req.params.slug, user._id.toString());
+    res.json({ access_token: sessionToken, expires_in: 1800 });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// GET /id/users/:slug/manage/me — equivalente a /userinfo pero para manage_session
 app.get("/id/users/:slug/manage/me", manageSessionAuth, async (req, res) => {
   const user = req.manageUser;
   res.json({
