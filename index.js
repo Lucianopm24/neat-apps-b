@@ -3782,7 +3782,7 @@ app.get("/id/users/:slug/verify-email", async (req, res) => {
     );
 
     // Redirigir a la página de login de la app con mensaje de éxito
-    res.redirect(`https://neat.qzz.io/verified?verified=1&redirect_uri=`);
+    res.redirect(`https://id.neat.qzz.io/${req.params.slug}?verified=1`);
   } catch (err) {
     console.error(err);
     res.status(500).send("Error interno");
@@ -4647,8 +4647,7 @@ app.post("/id/users/:slug/manage/login", async (req, res) => {
     if (!valid) return res.status(401).json({ error: "Credenciales inválidas" });
     if (user.suspended) return res.status(403).json({ error: "Cuenta suspendida en esta app" });
 
-    const sessionToken = generateManageSessionToken(req.params.slug, user._id.toString());
-    res.json({ access_token: sessionToken, expires_in: 1800 });
+    return emitTokenOrRequire2fa(user, req.params.slug, res);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Error interno" });
@@ -4747,6 +4746,7 @@ app.get("/id/users/:slug/manage/me", manageSessionAuth, async (req, res) => {
     isNeatUser: !!user.neatUserId,
     neatUserId: user.neatUserId || null,
     hasPassword: !!user.passwordHash,
+    totp2faEnabled: !!user.totpEnabled,
     verified: !!user.verified,
     createdAt: user.createdAt
   });
@@ -5514,6 +5514,280 @@ app.delete("/apps/:id", adminAuth, async (req, res) => {
     res.json({ ok: true });
   } catch {
     res.status(400).json({ error: "Invalid id" });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// RECUPERACIÓN DE CONTRASEÑA
+// Dos caminos:
+//   - email @neat.qzz.io → se les dice que entren con Neat desde /manage
+//   - otro email → token de 1h enviado por correo, formulario para nueva pass
+// ══════════════════════════════════════════════════════════════════════════════
+
+// POST /id/users/:slug/forgot-password
+// Pide reset por email. Respuesta siempre genérica para no revelar si el email existe.
+app.post("/id/users/:slug/forgot-password", async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: "email requerido" });
+
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app || app.suspended) return res.status(404).json({ error: "App no encontrada" });
+
+    const user = await database.collection("id_app_users").findOne({
+      appSlug: req.params.slug, email: email.toLowerCase()
+    });
+
+    // Siempre respondemos ok para no revelar si el email existe
+    if (!user || !user.passwordHash) return res.json({ ok: true });
+
+    // @neat.qzz.io no puede recibir correos — no enviamos nada,
+    // el frontend ya les habrá dicho que entren con Neat
+    if (user.email.endsWith("@neat.qzz.io")) return res.json({ ok: true });
+
+    const resetToken = crypto.randomBytes(32).toString("hex");
+    const resetExpiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1h
+    await database.collection("id_app_users").updateOne(
+      { _id: user._id },
+      { $set: { passwordResetToken: resetToken, passwordResetExpiresAt: resetExpiresAt } }
+    );
+
+    const resetUrl = `${NEAT_ID_BASE}/${req.params.slug}?reset_token=${resetToken}`;
+    await sendEmail({
+      to: user.email,
+      subject: `Recupera tu contraseña en ${app.name}`,
+      html: `
+        <div style="font-family:sans-serif;max-width:480px;margin:0 auto">
+          <h2 style="color:#1f1f1f">Recuperar contraseña</h2>
+          <p>Hola <strong>${user.username}</strong>, recibimos una solicitud para restablecer tu contraseña en <strong>${app.name}</strong>.</p>
+          <p>Haz clic en el botón para elegir una nueva contraseña:</p>
+          <a href="${resetUrl}" style="display:inline-block;margin:16px 0;padding:12px 24px;background:#0b57d0;color:#fff;border-radius:8px;text-decoration:none;font-weight:600">Restablecer contraseña</a>
+          <p style="color:#666;font-size:13px">Este enlace expira en 1 hora. Si no solicitaste esto, ignora este mensaje.</p>
+        </div>
+      `
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// POST /id/users/:slug/reset-password
+// Canjea el token de reset y establece la nueva contraseña
+app.post("/id/users/:slug/reset-password", async (req, res) => {
+  try {
+    const { token, newPassword } = req.body;
+    if (!token || !newPassword) return res.status(400).json({ error: "token y newPassword requeridos" });
+    if (newPassword.length < 8) return res.status(400).json({ error: "Mínimo 8 caracteres" });
+
+    const database = await getDb();
+    const user = await database.collection("id_app_users").findOne({
+      appSlug: req.params.slug,
+      passwordResetToken: token
+    });
+    if (!user) return res.status(400).json({ error: "Token inválido o ya usado" });
+    if (new Date() > new Date(user.passwordResetExpiresAt))
+      return res.status(400).json({ error: "El enlace expiró. Solicita uno nuevo." });
+
+    const newHash = await bcrypt.hash(newPassword, 10);
+    await database.collection("id_app_users").updateOne(
+      { _id: user._id },
+      { $set: { passwordHash: newHash, passwordResetToken: null, passwordResetExpiresAt: null } }
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 2FA / TOTP
+// - Opcional por defecto, forzable por tenant (require2fa en id_apps)
+// - Aplica a login local Y a "Continuar con Neat"
+// - Setup: genera secret + QR URI, el usuario escanea y confirma con un código
+// - Backup codes: 8 códigos de un solo uso para recuperación
+// - Endpoints de gestión en /manage (requieren manage_session)
+// - Login con 2FA: emite un totp_pending_token (5 min) en vez del token final,
+//   el frontend pide el código y lo canjea por el token real
+// ══════════════════════════════════════════════════════════════════════════════
+
+let _otplib = null;
+function getOtplib() {
+  if (!_otplib) {
+    try { _otplib = require("otplib"); } catch {
+      throw new Error("otplib no instalado. Ejecuta: npm install otplib");
+    }
+  }
+  return _otplib;
+}
+
+function generateBackupCodes() {
+  return Array.from({ length: 8 }, () => crypto.randomBytes(4).toString("hex").toUpperCase());
+}
+
+// Middleware: si el usuario tiene 2FA activo (o el tenant lo requiere y el
+// usuario lo tiene configurado), en vez de emitir el token final emite un
+// totp_pending_token de 5 min. El frontend lo intercepta y muestra el paso de 2FA.
+// Se usa en manage/login y en el callback de Neat.
+function emitTokenOrRequire2fa(user, appSlug, res, { tokenType = "manage_session" } = {}) {
+  const needs2fa = user.totpEnabled || false;
+  if (needs2fa) {
+    const pendingToken = jwt.sign(
+      { type: "totp_pending", appSlug, sub: user._id.toString(), tokenType },
+      SECRET,
+      { expiresIn: "5m" }
+    );
+    return res.json({ totp_required: true, totp_pending_token: pendingToken });
+  }
+  if (tokenType === "manage_session") {
+    const sessionToken = generateManageSessionToken(appSlug, user._id.toString());
+    return res.json({ access_token: sessionToken, expires_in: 1800 });
+  }
+  // Para el flujo OAuth (callback de Neat) no usamos esta función — se maneja aparte
+}
+
+// POST /id/users/:slug/manage/2fa/setup
+// Genera un nuevo secret TOTP y devuelve la URI para el QR. No activa 2FA todavía.
+app.post("/id/users/:slug/manage/2fa/setup", manageSessionAuth, async (req, res) => {
+  try {
+    const { authenticator } = getOtplib();
+    const secret = authenticator.generateSecret();
+    const user = req.manageUser;
+    const app = await req.manageDb.collection("id_apps").findOne({ slug: req.params.slug });
+
+    // Guardamos el secret pendiente (no activo aún — se activa al verificar)
+    await req.manageDb.collection("id_app_users").updateOne(
+      { _id: user._id },
+      { $set: { totpSecretPending: secret } }
+    );
+
+    const issuer = app?.name || "Neat ID";
+    const otpauth = authenticator.keyuri(user.email, issuer, secret);
+    res.json({ secret, otpauth });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || "Error interno" });
+  }
+});
+
+// POST /id/users/:slug/manage/2fa/verify
+// Confirma el código del autenticador y activa 2FA. Devuelve los backup codes.
+app.post("/id/users/:slug/manage/2fa/verify", manageSessionAuth, async (req, res) => {
+  try {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ error: "code requerido" });
+
+    const { authenticator } = getOtplib();
+    const user = req.manageUser;
+    if (!user.totpSecretPending)
+      return res.status(400).json({ error: "Inicia el setup primero" });
+
+    const valid = authenticator.verify({ token: code.replace(/\s/g, ""), secret: user.totpSecretPending });
+    if (!valid) return res.status(401).json({ error: "Código incorrecto" });
+
+    const backupCodes = generateBackupCodes();
+    const backupHashes = await Promise.all(backupCodes.map(c => bcrypt.hash(c, 8)));
+
+    await req.manageDb.collection("id_app_users").updateOne(
+      { _id: user._id },
+      { $set: {
+        totpSecret: user.totpSecretPending,
+        totpSecretPending: null,
+        totpEnabled: true,
+        totpBackupCodes: backupHashes
+      }}
+    );
+    res.json({ ok: true, backupCodes }); // solo se muestran una vez
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || "Error interno" });
+  }
+});
+
+// POST /id/users/:slug/manage/2fa/disable
+// Desactiva 2FA. Requiere el código actual del autenticador (o un backup code).
+app.post("/id/users/:slug/manage/2fa/disable", manageSessionAuth, async (req, res) => {
+  try {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ error: "code requerido" });
+
+    const { authenticator } = getOtplib();
+    const user = req.manageUser;
+    if (!user.totpEnabled) return res.status(400).json({ error: "2FA no está activado" });
+
+    const totpValid = authenticator.verify({ token: code.replace(/\s/g, ""), secret: user.totpSecret });
+    let backupValid = false;
+    let usedBackupIdx = -1;
+    if (!totpValid && user.totpBackupCodes?.length) {
+      for (let i = 0; i < user.totpBackupCodes.length; i++) {
+        if (await bcrypt.compare(code.replace(/\s/g, "").toUpperCase(), user.totpBackupCodes[i])) {
+          backupValid = true; usedBackupIdx = i; break;
+        }
+      }
+    }
+    if (!totpValid && !backupValid) return res.status(401).json({ error: "Código incorrecto" });
+
+    await req.manageDb.collection("id_app_users").updateOne(
+      { _id: user._id },
+      { $set: { totpSecret: null, totpEnabled: false, totpBackupCodes: [], totpSecretPending: null } }
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || "Error interno" });
+  }
+});
+
+// POST /id/users/:slug/manage/2fa/totp
+// Canjea un totp_pending_token + código TOTP (o backup code) por el manage_session real
+app.post("/id/users/:slug/manage/2fa/totp", async (req, res) => {
+  try {
+    const { totp_pending_token, code } = req.body;
+    if (!totp_pending_token || !code) return res.status(400).json({ error: "totp_pending_token y code requeridos" });
+
+    let payload;
+    try {
+      payload = jwt.verify(totp_pending_token, SECRET);
+    } catch { return res.status(401).json({ error: "Token expirado o inválido" }); }
+
+    if (payload.type !== "totp_pending" || payload.appSlug !== req.params.slug)
+      return res.status(401).json({ error: "Token inválido para esta app" });
+
+    const database = await getDb();
+    const user = await database.collection("id_app_users").findOne({ _id: new ObjectId(payload.sub) });
+    if (!user || user.suspended) return res.status(403).json({ error: "Usuario no disponible" });
+
+    const { authenticator } = getOtplib();
+    const totpValid = authenticator.verify({ token: code.replace(/\s/g, ""), secret: user.totpSecret });
+    let backupValid = false;
+    let usedBackupIdx = -1;
+    if (!totpValid && user.totpBackupCodes?.length) {
+      for (let i = 0; i < user.totpBackupCodes.length; i++) {
+        if (await bcrypt.compare(code.replace(/\s/g, "").toUpperCase(), user.totpBackupCodes[i])) {
+          backupValid = true; usedBackupIdx = i; break;
+        }
+      }
+    }
+    if (!totpValid && !backupValid) return res.status(401).json({ error: "Código incorrecto" });
+
+    // Invalidar backup code usado
+    if (backupValid && usedBackupIdx >= 0) {
+      const newBackups = [...user.totpBackupCodes];
+      newBackups.splice(usedBackupIdx, 1);
+      await database.collection("id_app_users").updateOne(
+        { _id: user._id }, { $set: { totpBackupCodes: newBackups } }
+      );
+    }
+
+    const sessionToken = generateManageSessionToken(req.params.slug, user._id.toString());
+    res.json({ access_token: sessionToken, expires_in: 1800 });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || "Error interno" });
   }
 });
 
