@@ -4319,6 +4319,190 @@ app.get("/id/userinfo", async (req, res) => {
   }
 });
 
+// ── 12.5 PANEL DE CUENTA (/SLUG/manage) ───────────────────────────────────────
+// Estos endpoints son DELIBERADAMENTE independientes de OAuth2: no usan
+// client_id, client_secret, code ni PKCE. El usuario entra con su email+pass
+// directo, sin ningún client de por medio — porque ningún client (ni siquiera
+// el internalClient público) debería poder generar acceso al panel de cuenta
+// de otro usuario, y el panel mismo no es "una app más" que consume el
+// sistema, es la gestión de la cuenta en sí.
+//
+// El token que emiten tiene type:"manage_session" — un tipo distinto al
+// type:"id_app" que usan los access_token de OAuth. Esto es a propósito:
+// un token de manage nunca debe servir en /id/userinfo, /id/token, ni en el
+// KV storage (evita que un client externo reciba por error un token con
+// estos privilegios). Y un access_token de OAuth normal tampoco sirve aquí
+// (evita que cualquier client de cualquier tenant use su propio login para
+// colarse en la gestión de cuenta).
+
+function generateManageSessionToken(slug, userId) {
+  return jwt.sign(
+    { type: "manage_session", appSlug: slug, sub: userId },
+    SECRET,
+    { expiresIn: "30m" }
+  );
+}
+
+// Middleware: valida un token de manage_session contra :slug de la URL.
+async function manageSessionAuth(req, res, next) {
+  try {
+    const header = req.headers.authorization;
+    if (!header) return res.status(401).json({ error: "Authorization requerido" });
+
+    let payload;
+    try {
+      payload = jwt.verify(header.replace("Bearer ", ""), SECRET);
+    } catch {
+      return res.status(401).json({ error: "Token inválido o expirado" });
+    }
+    if (payload.type !== "manage_session")
+      return res.status(403).json({ error: "Token no es de sesión de cuenta" });
+    if (payload.appSlug !== req.params.slug)
+      return res.status(403).json({ error: "Token no corresponde a esta app" });
+
+    const database = await getDb();
+    const user = await database.collection("id_app_users").findOne({ _id: new ObjectId(payload.sub) });
+    if (!user) return res.status(404).json({ error: "Usuario no encontrado" });
+    if (user.suspended) return res.status(403).json({ error: "Cuenta suspendida" });
+
+    req.manageUser = user;
+    req.manageDb = database;
+    req.manageRawToken = header.replace("Bearer ", "");
+    next();
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+}
+
+// POST /id/users/:slug/manage/login
+// Login directo email+password. Sin client, sin code, sin OAuth.
+app.post("/id/users/:slug/manage/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: "email y password requeridos" });
+
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app || app.suspended) return res.status(403).json({ error: "App suspendida o no encontrada" });
+
+    const user = await database.collection("id_app_users").findOne({
+      appSlug: req.params.slug,
+      email: email.toLowerCase()
+    });
+    if (!user) return res.status(401).json({ error: "Credenciales inválidas" });
+    if (!user.passwordHash)
+      return res.status(401).json({ error: "Esta cuenta no tiene contraseña local (entra solo con Neat)" });
+
+    const valid = await bcrypt.compare(password, user.passwordHash);
+    if (!valid) return res.status(401).json({ error: "Credenciales inválidas" });
+    if (user.suspended) return res.status(403).json({ error: "Cuenta suspendida en esta app" });
+
+    const sessionToken = generateManageSessionToken(req.params.slug, user._id.toString());
+    res.json({ access_token: sessionToken, expires_in: 1800 });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// GET /id/users/:slug/manage/me — equivalente a /userinfo pero para manage_session
+app.get("/id/users/:slug/manage/me", manageSessionAuth, async (req, res) => {
+  const user = req.manageUser;
+  res.json({
+    sub: user._id.toString(),
+    username: user.username,
+    email: user.email,
+    isNeatUser: !!user.neatUserId,
+    neatUserId: user.neatUserId || null,
+    hasPassword: !!user.passwordHash,
+    verified: !!user.verified,
+    createdAt: user.createdAt
+  });
+});
+
+// PUT /id/users/:slug/manage/password — cambiar o establecer contraseña
+app.put("/id/users/:slug/manage/password", manageSessionAuth, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!newPassword || newPassword.length < 8)
+      return res.status(400).json({ error: "La contraseña nueva debe tener al menos 8 caracteres" });
+
+    const user = req.manageUser;
+    if (user.passwordHash) {
+      if (!currentPassword) return res.status(400).json({ error: "Contraseña actual requerida" });
+      const valid = await bcrypt.compare(currentPassword, user.passwordHash);
+      if (!valid) return res.status(401).json({ error: "Contraseña actual incorrecta" });
+    }
+    // Si user.passwordHash no existe (cuenta 100% Neat), se permite
+    // establecer una contraseña nueva sin pedir la "actual" (no existe).
+
+    const newHash = await bcrypt.hash(newPassword, 10);
+    await req.manageDb.collection("id_app_users").updateOne(
+      { _id: user._id },
+      { $set: { passwordHash: newHash } }
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// GET /id/users/:slug/manage/sessions — sesiones OAuth activas del usuario (por client)
+app.get("/id/users/:slug/manage/sessions", manageSessionAuth, async (req, res) => {
+  try {
+    const sessions = await req.manageDb.collection("id_app_sessions").find({
+      appSlug: req.params.slug,
+      userId: req.manageUser._id.toString(),
+      expiresAt: { $gt: new Date() }
+    }).toArray();
+
+    const clientIds = [...new Set(sessions.map(s => s.clientId))];
+    const clients = await req.manageDb.collection("id_app_clients")
+      .find({ clientId: { $in: clientIds } }).toArray();
+    const clientNameById = Object.fromEntries(clients.map(c => [c.clientId, c.name || c.clientId]));
+
+    // Nota: la sesión de manage (este mismo token) nunca aparece en
+    // id_app_sessions — esa colección solo guarda access_token tipo "id_app"
+    // emitidos por /id/token vía OAuth. isCurrent queda siempre en false
+    // porque ninguna de estas filas puede ser "esta misma sesión de manage".
+    res.json({
+      sessions: sessions.map(s => ({
+        id: s._id.toString(),
+        clientId: s.clientId,
+        clientName: clientNameById[s.clientId] || "App desconocida",
+        createdAt: s.createdAt,
+        expiresAt: s.expiresAt,
+        isCurrent: false
+      }))
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// DELETE /id/users/:slug/manage/sessions/:sessionId — revocar una sesión propia
+app.delete("/id/users/:slug/manage/sessions/:sessionId", manageSessionAuth, async (req, res) => {
+  try {
+    let sessionObjId;
+    try { sessionObjId = new ObjectId(req.params.sessionId); }
+    catch { return res.status(400).json({ error: "sessionId inválido" }); }
+
+    const result = await req.manageDb.collection("id_app_sessions").deleteOne({
+      _id: sessionObjId,
+      appSlug: req.params.slug,
+      userId: req.manageUser._id.toString()   // solo puede borrar SUS propias sesiones
+    });
+    if (result.deletedCount === 0) return res.status(404).json({ error: "Sesión no encontrada" });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
 // ── 13. VINCULAR CUENTA NEAT A USUARIO LOCAL ──────────────────────────────────
 // POST /id/users/:slug/link-neat
 // Un usuario que entró con email+pass local puede vincular su cuenta Neat.
@@ -4331,23 +4515,25 @@ app.post("/id/users/:slug/link-neat", async (req, res) => {
     if (!neatCode || !localAccessToken || !codeVerifier)
       return res.status(400).json({ error: "neatCode, localAccessToken y codeVerifier requeridos" });
 
-    // Acepta dos tipos de token:
+    // Acepta tres tipos de token:
     //  - "id_app": sesión real emitida por /id/token (el dev la usa desde su backend/app)
     //  - "id_app_page_session": token corto (10 min) emitido por /id/users/:slug/login,
     //    usado SOLO por la hosted login page para vincular Neat en el mismo flujo,
     //    sin que el code/credenciales del tenant entren en juego.
+    //  - "manage_session": sesión del panel de cuenta (/SLUG/manage), emitida por
+    //    /id/users/:slug/manage/login — login directo, sin client de por medio.
     let localPayload;
     try {
       localPayload = jwt.verify(localAccessToken, SECRET);
     } catch {
       return res.status(401).json({ error: "Token local inválido" });
     }
-    const validTypes = ["id_app", "id_app_page_session"];
+    const validTypes = ["id_app", "id_app_page_session", "manage_session"];
     if (!validTypes.includes(localPayload.type) || localPayload.appSlug !== req.params.slug)
       return res.status(401).json({ error: "Token no corresponde a esta app" });
 
     // Normalizamos el id de usuario local según el tipo de token
-    const localUserId = localPayload.type === "id_app" ? localPayload.sub : localPayload.idAppUserId;
+    const localUserId = localPayload.type === "id_app_page_session" ? localPayload.idAppUserId : localPayload.sub;
 
     const database = await getDb();
     const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
@@ -4408,7 +4594,7 @@ app.delete("/id/users/:slug/link-neat", async (req, res) => {
     } catch {
       return res.status(401).json({ error: "Token inválido" });
     }
-    if (payload.type !== "id_app" || payload.appSlug !== req.params.slug)
+    if (!["id_app", "manage_session"].includes(payload.type) || payload.appSlug !== req.params.slug)
       return res.status(403).json({ error: "Token no corresponde a esta app" });
 
     const database = await getDb();
