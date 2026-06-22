@@ -3718,6 +3718,7 @@ app.get("/id/apps/:slug/public", async (req, res) => {
       internalClientId: app.internalClientId,
       appKey: app.appKey,
       requireEmailVerification: !!app.requireEmailVerification,
+      registrationsOpen: app.registrationsOpen !== false,
       clientName
     });
   } catch {
@@ -4054,7 +4055,7 @@ app.delete("/id/apps/:slug", auth, requireAuth, async (req, res) => {
 // El dev NO llama esto, es uso interno de la hosted page.
 app.post("/id/users/:slug/register", async (req, res) => {
   try {
-    const { email, password, username, internalToken } = req.body;
+    const { email, password, username, internalToken, inviteToken } = req.body;
 
     // Verificar internalToken — JWT firmado por Neat con claim { internal: true, appSlug }
     // La hosted login page recibe este token al cargar la página
@@ -4077,6 +4078,21 @@ app.post("/id/users/:slug/register", async (req, res) => {
     const database = await getDb();
     const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
     if (!app || app.suspended) return res.status(404).json({ error: "App no encontrada" });
+
+    // Verificar si los registros están abiertos o si hay un inviteToken válido
+    const registrationsOpen = app.registrationsOpen !== false; // default true
+    let invitation = null;
+    if (!registrationsOpen) {
+      if (!inviteToken) return res.status(403).json({ error: "Los registros están cerrados. Necesitas una invitación." });
+      invitation = await database.collection("id_app_invitations").findOne({
+        appSlug: req.params.slug, token: inviteToken
+      });
+      if (!invitation) return res.status(404).json({ error: "Invitación no encontrada" });
+      if (invitation.revoked) return res.status(410).json({ error: "Invitación revocada" });
+      if (new Date() > invitation.expiresAt) return res.status(410).json({ error: "Invitación expirada" });
+      if (invitation.maxUses !== null && invitation.uses >= invitation.maxUses)
+        return res.status(410).json({ error: "Invitación agotada" });
+    }
 
     // Email único por tenant
     const exists = await database.collection("id_app_users").findOne({
@@ -4130,6 +4146,14 @@ app.post("/id/users/:slug/register", async (req, res) => {
           </div>
         `
       });
+    }
+
+    // Quemar uso de la invitación si aplica
+    if (invitation) {
+      await database.collection("id_app_invitations").updateOne(
+        { _id: invitation._id },
+        { $inc: { uses: 1 } }
+      );
     }
 
     res.status(201).json({
@@ -4502,6 +4526,12 @@ app.post("/id/token", async (req, res) => {
     if (!appUser) return res.status(404).json({ error: "Usuario no encontrado" });
     if (appUser.suspended) return res.status(403).json({ error: "Usuario suspendido" });
 
+    // Cargar grupos del usuario en este tenant
+    const memberships = await database.collection("id_app_memberships")
+      .find({ appSlug: oauthCode.appSlug, userId: appUser._id.toString() })
+      .toArray();
+    const groups = Object.fromEntries(memberships.map(m => [m.groupKey, m.roles]));
+
     // Emitir access_token — payload de usuario local (no Neat global)
     const accessToken = jwt.sign(
       {
@@ -4512,6 +4542,7 @@ app.post("/id/token", async (req, res) => {
         email: appUser.email,
         neatUserId: appUser.neatUserId || null,
         isNeatUser: !!appUser.neatUserId,
+        groups,
       },
       SECRET,
       { expiresIn: "24h" }
@@ -4529,6 +4560,7 @@ app.post("/id/token", async (req, res) => {
         username: appUser.username,
         neat_user: !!appUser.neatUserId,
         neat_user_id: appUser.neatUserId || undefined,
+        groups,
       },
       SECRET,
       { algorithm: "HS256" }
@@ -4582,6 +4614,11 @@ app.get("/id/userinfo", async (req, res) => {
     if (!user) return res.status(404).json({ error: "Usuario no encontrado" });
     if (user.suspended) return res.status(403).json({ error: "Usuario suspendido" });
 
+    const memberships = await database.collection("id_app_memberships")
+      .find({ appSlug: user.appSlug, userId: user._id.toString() })
+      .toArray();
+    const groups = Object.fromEntries(memberships.map(m => [m.groupKey, m.roles]));
+
     res.json({
       sub: user._id.toString(),
       username: user.username,
@@ -4590,7 +4627,8 @@ app.get("/id/userinfo", async (req, res) => {
       isNeatUser: !!user.neatUserId,
       neatUserId: user.neatUserId || null,
       verified: !!user.verified,
-      createdAt: user.createdAt
+      createdAt: user.createdAt,
+      groups
     });
   } catch (err) {
     console.error(err);
@@ -5888,46 +5926,342 @@ function generatePkcePair() {
   return { codeVerifier, codeChallenge };
 }
 
+// ── REGISTROS ABIERTOS/CERRADOS ───────────────────────────────────────────────
+// PUT /id/apps/:slug/registrations
+// Abre o cierra el registro público del tenant.
+app.put("/id/apps/:slug/registrations", tenantAuth, async (req, res) => {
+  try {
+    if (req.idApp.slug !== req.params.slug)
+      return res.status(403).json({ error: "Credenciales no corresponden a esta app" });
+
+    const { open } = req.body;
+    if (typeof open !== "boolean")
+      return res.status(400).json({ error: "El campo 'open' debe ser booleano" });
+
+    const database = await getDb();
+    await database.collection("id_apps").updateOne(
+      { slug: req.params.slug },
+      { $set: { registrationsOpen: open } }
+    );
+    res.json({ ok: true, registrationsOpen: open });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── CREAR USUARIO DIRECTO (admin del tenant) ──────────────────────────────────
+// POST /id/apps/:slug/users
+// El admin crea un usuario sin que este se registre solo.
+app.post("/id/apps/:slug/users", tenantAuth, async (req, res) => {
+  try {
+    if (req.idApp.slug !== req.params.slug)
+      return res.status(403).json({ error: "Credenciales no corresponden a esta app" });
+
+    const { email, password, username } = req.body;
+    if (!email || !password) return res.status(400).json({ error: "email y password requeridos" });
+    if (password.length < 6) return res.status(400).json({ error: "Password mínimo 6 caracteres" });
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+      return res.status(400).json({ error: "Email inválido" });
+
+    const database = await getDb();
+    const exists = await database.collection("id_app_users").findOne({
+      appSlug: req.params.slug, email: email.toLowerCase()
+    });
+    if (exists) return res.status(409).json({ error: "Email ya registrado en esta app" });
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const result = await database.collection("id_app_users").insertOne({
+      appSlug: req.params.slug,
+      email: email.toLowerCase(),
+      username: username || email.split("@")[0],
+      passwordHash,
+      neatUserId: null,
+      emailVerified: true, // creado por admin = verificado
+      emailVerifToken: null,
+      emailVerifExpiresAt: null,
+      suspended: false,
+      createdAt: new Date(),
+      createdByAdmin: true
+    });
+
+    res.status(201).json({ ok: true, userId: result.insertedId });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── INVITACIONES POR LINK ─────────────────────────────────────────────────────
+// POST /id/apps/:slug/invitations — crear invitación
+// body: { expiresIn: "24h"|"48h"|"7d", maxUses: null|number } (null = ilimitado)
+app.post("/id/apps/:slug/invitations", tenantAuth, async (req, res) => {
+  try {
+    if (req.idApp.slug !== req.params.slug)
+      return res.status(403).json({ error: "Credenciales no corresponden a esta app" });
+
+    const { expiresIn = "48h", maxUses } = req.body;
+
+    const msMap = { "24h": 24*60*60*1000, "48h": 48*60*60*1000, "7d": 7*24*60*60*1000 };
+    if (!msMap[expiresIn]) return res.status(400).json({ error: "expiresIn debe ser 24h, 48h o 7d" });
+
+    // maxUses: null = ilimitado, 1 = único, N = N usos
+    let parsedMaxUses = null;
+    if (maxUses !== undefined && maxUses !== null) {
+      parsedMaxUses = parseInt(maxUses);
+      if (isNaN(parsedMaxUses) || parsedMaxUses < 1)
+        return res.status(400).json({ error: "maxUses debe ser un número positivo o null" });
+    }
+
+    const token = crypto.randomBytes(32).toString("hex");
+    const database = await getDb();
+    await database.collection("id_app_invitations").insertOne({
+      appSlug: req.params.slug,
+      token,
+      maxUses: parsedMaxUses,
+      uses: 0,
+      expiresAt: new Date(Date.now() + msMap[expiresIn]),
+      createdAt: new Date(),
+      revoked: false
+    });
+
+    res.status(201).json({ ok: true, token, inviteUrl: `https://id.neat.qzz.io/${req.params.slug}?inviteToken=${token}` });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// GET /id/apps/:slug/invitations — listar invitaciones activas
+app.get("/id/apps/:slug/invitations", tenantAuth, async (req, res) => {
+  try {
+    if (req.idApp.slug !== req.params.slug)
+      return res.status(403).json({ error: "Credenciales no corresponden a esta app" });
+
+    const database = await getDb();
+    const invitations = await database.collection("id_app_invitations")
+      .find({ appSlug: req.params.slug })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.json({ invitations });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// DELETE /id/apps/:slug/invitations/:token — revocar invitación
+app.delete("/id/apps/:slug/invitations/:token", tenantAuth, async (req, res) => {
+  try {
+    if (req.idApp.slug !== req.params.slug)
+      return res.status(403).json({ error: "Credenciales no corresponden a esta app" });
+
+    const database = await getDb();
+    await database.collection("id_app_invitations").updateOne(
+      { appSlug: req.params.slug, token: req.params.token },
+      { $set: { revoked: true } }
+    );
+    res.json({ ok: true });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// GET /id/apps/:slug/invitations/:token/validate — valida un token de invitación (público, lo llama el frontend)
+app.get("/id/apps/:slug/invitations/:token/validate", async (req, res) => {
+  try {
+    const database = await getDb();
+    const inv = await database.collection("id_app_invitations").findOne({
+      appSlug: req.params.slug, token: req.params.token
+    });
+    if (!inv) return res.status(404).json({ error: "Invitación no encontrada" });
+    if (inv.revoked) return res.status(410).json({ error: "Invitación revocada" });
+    if (new Date() > inv.expiresAt) return res.status(410).json({ error: "Invitación expirada" });
+    if (inv.maxUses !== null && inv.uses >= inv.maxUses)
+      return res.status(410).json({ error: "Invitación agotada" });
+
+    res.json({ ok: true, appSlug: req.params.slug });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── GRUPOS CON ROLES ──────────────────────────────────────────────────────────
+// POST /id/apps/:slug/groups — crear grupo
+// body: { name, key, description }
+app.post("/id/apps/:slug/groups", tenantAuth, async (req, res) => {
+  try {
+    if (req.idApp.slug !== req.params.slug)
+      return res.status(403).json({ error: "Credenciales no corresponden a esta app" });
+
+    const { name, key, description } = req.body;
+    if (!name || !key) return res.status(400).json({ error: "name y key requeridos" });
+    if (!/^[a-z0-9-]+$/.test(key))
+      return res.status(400).json({ error: "key solo puede contener letras minúsculas, números y guiones" });
+
+    const database = await getDb();
+    const exists = await database.collection("id_app_groups").findOne({
+      appSlug: req.params.slug, key
+    });
+    if (exists) return res.status(409).json({ error: "Ya existe un grupo con ese key" });
+
+    await database.collection("id_app_groups").insertOne({
+      appSlug: req.params.slug,
+      name,
+      key,
+      description: description || null,
+      createdAt: new Date()
+    });
+
+    res.status(201).json({ ok: true });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// GET /id/apps/:slug/groups — listar grupos del tenant
+app.get("/id/apps/:slug/groups", tenantAuth, async (req, res) => {
+  try {
+    if (req.idApp.slug !== req.params.slug)
+      return res.status(403).json({ error: "Credenciales no corresponden a esta app" });
+
+    const database = await getDb();
+    const groups = await database.collection("id_app_groups")
+      .find({ appSlug: req.params.slug })
+      .sort({ createdAt: 1 })
+      .toArray();
+
+    res.json({ groups });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// PUT /id/apps/:slug/groups/:key — editar nombre/descripción de un grupo
+app.put("/id/apps/:slug/groups/:key", tenantAuth, async (req, res) => {
+  try {
+    if (req.idApp.slug !== req.params.slug)
+      return res.status(403).json({ error: "Credenciales no corresponden a esta app" });
+
+    const { name, description } = req.body;
+    const database = await getDb();
+    await database.collection("id_app_groups").updateOne(
+      { appSlug: req.params.slug, key: req.params.key },
+      { $set: { name, description: description || null } }
+    );
+    res.json({ ok: true });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// DELETE /id/apps/:slug/groups/:key — eliminar grupo y sus membresías
+app.delete("/id/apps/:slug/groups/:key", tenantAuth, async (req, res) => {
+  try {
+    if (req.idApp.slug !== req.params.slug)
+      return res.status(403).json({ error: "Credenciales no corresponden a esta app" });
+
+    const database = await getDb();
+    await database.collection("id_app_groups").deleteOne({ appSlug: req.params.slug, key: req.params.key });
+    await database.collection("id_app_memberships").deleteMany({ appSlug: req.params.slug, groupKey: req.params.key });
+    res.json({ ok: true });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// GET /id/apps/:slug/groups/:key/members — listar miembros de un grupo
+app.get("/id/apps/:slug/groups/:key/members", tenantAuth, async (req, res) => {
+  try {
+    if (req.idApp.slug !== req.params.slug)
+      return res.status(403).json({ error: "Credenciales no corresponden a esta app" });
+
+    const database = await getDb();
+    const memberships = await database.collection("id_app_memberships")
+      .find({ appSlug: req.params.slug, groupKey: req.params.key })
+      .toArray();
+
+    // Enriquecer con datos del usuario
+    const userIds = memberships.map(m => new ObjectId(m.userId));
+    const users = await database.collection("id_app_users")
+      .find({ _id: { $in: userIds } }, { projection: { passwordHash: 0 } })
+      .toArray();
+    const userMap = Object.fromEntries(users.map(u => [u._id.toString(), u]));
+
+    const result = memberships.map(m => ({
+      ...m,
+      user: userMap[m.userId] || null
+    }));
+
+    res.json({ members: result });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// PUT /id/apps/:slug/groups/:key/members/:userId — agregar o actualizar roles de un miembro
+// body: { roles: ["admin", "member", ...] }
+app.put("/id/apps/:slug/groups/:key/members/:userId", tenantAuth, async (req, res) => {
+  try {
+    if (req.idApp.slug !== req.params.slug)
+      return res.status(403).json({ error: "Credenciales no corresponden a esta app" });
+
+    const { roles = [] } = req.body;
+    if (!Array.isArray(roles)) return res.status(400).json({ error: "roles debe ser un array" });
+
+    const database = await getDb();
+
+    // Verificar que el grupo y el usuario existen en este tenant
+    const group = await database.collection("id_app_groups").findOne({ appSlug: req.params.slug, key: req.params.key });
+    if (!group) return res.status(404).json({ error: "Grupo no encontrado" });
+
+    const user = await database.collection("id_app_users").findOne({
+      _id: new ObjectId(req.params.userId), appSlug: req.params.slug
+    });
+    if (!user) return res.status(404).json({ error: "Usuario no encontrado" });
+
+    await database.collection("id_app_memberships").updateOne(
+      { appSlug: req.params.slug, groupKey: req.params.key, userId: req.params.userId },
+      { $set: { roles, updatedAt: new Date() }, $setOnInsert: { createdAt: new Date() } },
+      { upsert: true }
+    );
+
+    res.json({ ok: true });
+  } catch {
+    res.status(400).json({ error: "ID inválido" });
+  }
+});
+
+// DELETE /id/apps/:slug/groups/:key/members/:userId — quitar miembro del grupo
+app.delete("/id/apps/:slug/groups/:key/members/:userId", tenantAuth, async (req, res) => {
+  try {
+    if (req.idApp.slug !== req.params.slug)
+      return res.status(403).json({ error: "Credenciales no corresponden a esta app" });
+
+    const database = await getDb();
+    await database.collection("id_app_memberships").deleteOne({
+      appSlug: req.params.slug, groupKey: req.params.key, userId: req.params.userId
+    });
+    res.json({ ok: true });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
 // ── Providers GLOBALES (los configura el dueño de Neat) ──────────────────────
 
 // POST /id/social/global — crear/configurar un provider global. Solo admin.
-// Modo discovery: { key, name, discoveryUrl, clientId, clientSecret, scope }
-// Modo manual (sin discovery, ej. Discord): { key, name, clientId, clientSecret,
-//   scope, authorizationEndpoint, tokenEndpoint, userinfoEndpoint }
+// body: { key, name, discoveryUrl, clientId, clientSecret, scope }
 app.post("/id/social/global", auth, requireAuth, async (req, res) => {
   try {
     if (req.user.role !== "admin") return res.status(403).json({ error: "Solo el admin de Neat puede configurar providers globales" });
 
-    const {
-      key, name, discoveryUrl, clientId, clientSecret, scope,
-      authorizationEndpoint, tokenEndpoint, userinfoEndpoint
-    } = req.body;
-    if (!key || !name || !clientId)
-      return res.status(400).json({ error: "key, name y clientId son requeridos" });
+    const { key, name, discoveryUrl, clientId, clientSecret, scope } = req.body;
+    if (!key || !name || !discoveryUrl || !clientId)
+      return res.status(400).json({ error: "key, name, discoveryUrl y clientId son requeridos" });
 
-    let endpoints;
-    if (discoveryUrl) {
-      let discovery;
-      try {
-        discovery = await fetchOidcDiscovery(discoveryUrl);
-      } catch (e) {
-        return res.status(400).json({ error: "Discovery URL inválida: " + e.message });
-      }
-      endpoints = {
-        authorizationEndpoint: discovery.authorization_endpoint,
-        tokenEndpoint: discovery.token_endpoint,
-        userinfoEndpoint: discovery.userinfo_endpoint || null
-      };
-    } else {
-      // Modo manual: el admin da los endpoints directamente (providers que no
-      // exponen .well-known/openid-configuration, ej. Discord, X, etc.)
-      if (!authorizationEndpoint || !tokenEndpoint)
-        return res.status(400).json({ error: "Sin discoveryUrl, authorizationEndpoint y tokenEndpoint son requeridos" });
-      endpoints = {
-        authorizationEndpoint,
-        tokenEndpoint,
-        userinfoEndpoint: userinfoEndpoint || null
-      };
+    let discovery;
+    try {
+      discovery = await fetchOidcDiscovery(discoveryUrl);
+    } catch (e) {
+      return res.status(400).json({ error: "Discovery URL inválida: " + e.message });
     }
 
     const database = await getDb();
@@ -5935,8 +6269,10 @@ app.post("/id/social/global", auth, requireAuth, async (req, res) => {
       { key },
       {
         $set: {
-          key, name, discoveryUrl: discoveryUrl || null,
-          ...endpoints,
+          key, name, discoveryUrl,
+          authorizationEndpoint: discovery.authorization_endpoint,
+          tokenEndpoint: discovery.token_endpoint,
+          userinfoEndpoint: discovery.userinfo_endpoint || null,
           clientId,
           clientSecret: clientSecret || null,  // confidential si se da, si no actúa como público
           scope: scope || "openid profile email",
@@ -5962,21 +6298,6 @@ app.get("/id/social/global", auth, requireAuth, async (req, res) => {
     const providers = await database.collection("social_providers_global")
       .find({}, { projection: { clientSecret: 0 } }).toArray();
     res.json(providers);
-  } catch {
-    res.status(500).json({ error: "Error interno" });
-  }
-});
-
-// PUT /id/social/global/:key — activar/desactivar sin eliminar. Solo admin.
-app.put("/id/social/global/:key", auth, requireAuth, async (req, res) => {
-  try {
-    if (req.user.role !== "admin") return res.status(403).json({ error: "Solo el admin de Neat puede hacer esto" });
-    const { enabled } = req.body;
-    const database = await getDb();
-    const result = await database.collection("social_providers_global")
-      .updateOne({ key: req.params.key }, { $set: { enabled: !!enabled, updatedAt: new Date() } });
-    if (result.matchedCount === 0) return res.status(404).json({ error: "Provider no encontrado" });
-    res.json({ ok: true });
   } catch {
     res.status(500).json({ error: "Error interno" });
   }
