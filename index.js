@@ -4152,7 +4152,7 @@ app.post("/id/users/:slug/register", async (req, res) => {
 // Genera el code OAuth2 local (id_app_local) + pageSessionToken para un usuario
 // ya autenticado. Se usa tanto en login directo (sin 2FA) como después de
 // verificar el código TOTP (login con 2FA).
-async function issueLocalOAuthCode(database, { user, appSlug, client, redirectUri, codeChallenge, codeChallengeMethod, state }) {
+async function issueLocalOAuthCode(database, { user, appSlug, client, redirectUri, codeChallenge, codeChallengeMethod, state, type = "id_app_local" }) {
   const finalRedirectUri = redirectUri || client.redirectUris[0];
   if (!client.redirectUris.includes(finalRedirectUri)) {
     return { error: "redirect_uri no autorizada para este client" };
@@ -4171,7 +4171,7 @@ async function issueLocalOAuthCode(database, { user, appSlug, client, redirectUr
     codeChallengeMethod: codeChallengeMethod || "S256",
     expiresAt: new Date(Date.now() + 5 * 60 * 1000),
     used: false,
-    type: "id_app_local"
+    type
   });
 
   const pageSessionToken = jwt.sign(
@@ -4758,7 +4758,9 @@ app.post("/id/users/:slug/manage/login-with-neat", async (req, res) => {
       );
     }
 
-    return emitTokenOrRequire2fa(user, req.params.slug, res);
+    // Entrar con "Continuar con Neat" ya es una verificación de identidad
+    // fuerte (pasó por el login de Neat mismo) — no se exige TOTP encima.
+    return emitTokenOrRequire2fa(user, req.params.slug, res, { skip2fa: true });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Error interno" });
@@ -5661,9 +5663,14 @@ function generateBackupCodes() {
 // Middleware: si el usuario tiene 2FA activo (o el tenant lo requiere y el
 // usuario lo tiene configurado), en vez de emitir el token final emite un
 // totp_pending_token de 5 min. El frontend lo intercepta y muestra el paso de 2FA.
-// Se usa en manage/login y en el callback de Neat.
-function emitTokenOrRequire2fa(user, appSlug, res, { tokenType = "manage_session" } = {}) {
-  const needs2fa = user.totpEnabled || false;
+// Se usa en manage/login y en el login normal de usuario final.
+//
+// skip2fa: true cuando la autenticación ya vino verificada por un proveedor
+// externo de identidad (Neat, o un proveedor social vía OIDC) — entrar con
+// ese proveedor ya es una prueba de identidad fuerte, así que no se pide TOTP
+// encima. Si el mismo usuario entra con email+contraseña local, sí se le pide.
+function emitTokenOrRequire2fa(user, appSlug, res, { tokenType = "manage_session", skip2fa = false } = {}) {
+  const needs2fa = !skip2fa && (user.totpEnabled || false);
   if (needs2fa) {
     const pendingToken = jwt.sign(
       { type: "totp_pending", appSlug, sub: user._id.toString(), tokenType },
@@ -5838,6 +5845,516 @@ app.post("/id/users/:slug/manage/2fa/totp", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message || "Error interno" });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SOCIAL LOGIN (OIDC genérico, vía discovery URL) ──────────────────────────────
+//
+// Dos tipos de provider:
+// - GLOBAL (social_providers_global): los configura el dueño de Neat (admin).
+//   Pueden tener client_secret (confidential) porque el secret es de Neat, no
+//   de un tercero — se guarda una sola vez, no por cada tenant.
+// - TENANT (social_providers_tenant): cada dueño de app pone su propio
+//   provider (ej. su propio Google). SIEMPRE PKCE, SIN client_secret —
+//   Neat nunca guarda secrets ajenos. Sin excepciones, ni para Neat Plus.
+//
+// Ambos se configuran dando solo la discovery URL
+// (.../.well-known/openid-configuration); Neat resuelve authorization_endpoint,
+// token_endpoint y userinfo_endpoint automáticamente.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Cache simple en memoria del documento OIDC por discovery URL (60 min) —
+// evita golpear el .well-known en cada login.
+const oidcDiscoveryCache = new Map();
+
+async function fetchOidcDiscovery(discoveryUrl) {
+  const cached = oidcDiscoveryCache.get(discoveryUrl);
+  if (cached && cached.expiresAt > Date.now()) return cached.doc;
+
+  const res = await fetch(discoveryUrl);
+  if (!res.ok) throw new Error("No se pudo leer la discovery URL (" + res.status + ")");
+  const doc = await res.json();
+  if (!doc.authorization_endpoint || !doc.token_endpoint)
+    throw new Error("La discovery URL no parece un documento OIDC válido");
+
+  oidcDiscoveryCache.set(discoveryUrl, { doc, expiresAt: Date.now() + 60 * 60 * 1000 });
+  return doc;
+}
+
+function generatePkcePair() {
+  const codeVerifier = crypto.randomBytes(32).toString("base64url");
+  const codeChallenge = crypto.createHash("sha256").update(codeVerifier).digest("base64url");
+  return { codeVerifier, codeChallenge };
+}
+
+// ── Providers GLOBALES (los configura el dueño de Neat) ──────────────────────
+
+// POST /id/social/global — crear/configurar un provider global. Solo admin.
+// body: { key, name, discoveryUrl, clientId, clientSecret, scope }
+app.post("/id/social/global", auth, requireAuth, async (req, res) => {
+  try {
+    if (req.user.role !== "admin") return res.status(403).json({ error: "Solo el admin de Neat puede configurar providers globales" });
+
+    const { key, name, discoveryUrl, clientId, clientSecret, scope } = req.body;
+    if (!key || !name || !discoveryUrl || !clientId)
+      return res.status(400).json({ error: "key, name, discoveryUrl y clientId son requeridos" });
+
+    let discovery;
+    try {
+      discovery = await fetchOidcDiscovery(discoveryUrl);
+    } catch (e) {
+      return res.status(400).json({ error: "Discovery URL inválida: " + e.message });
+    }
+
+    const database = await getDb();
+    await database.collection("social_providers_global").updateOne(
+      { key },
+      {
+        $set: {
+          key, name, discoveryUrl,
+          authorizationEndpoint: discovery.authorization_endpoint,
+          tokenEndpoint: discovery.token_endpoint,
+          userinfoEndpoint: discovery.userinfo_endpoint || null,
+          clientId,
+          clientSecret: clientSecret || null,  // confidential si se da, si no actúa como público
+          scope: scope || "openid profile email",
+          enabled: true,
+          updatedAt: new Date()
+        },
+        $setOnInsert: { createdAt: new Date() }
+      },
+      { upsert: true }
+    );
+    res.json({ ok: true, key });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// GET /id/social/global — listar providers globales (sin el secret), para que
+// cualquier tenant vea cuáles puede activar.
+app.get("/id/social/global", auth, requireAuth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const providers = await database.collection("social_providers_global")
+      .find({}, { projection: { clientSecret: 0 } }).toArray();
+    res.json(providers);
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// DELETE /id/social/global/:key — solo admin
+app.delete("/id/social/global/:key", auth, requireAuth, async (req, res) => {
+  try {
+    if (req.user.role !== "admin") return res.status(403).json({ error: "Solo el admin de Neat puede hacer esto" });
+    const database = await getDb();
+    await database.collection("social_providers_global").deleteOne({ key: req.params.key });
+    res.json({ ok: true });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── Providers POR TENANT (cada dueño de app pone el suyo) ────────────────────
+// SIEMPRE PKCE — nunca se acepta ni se guarda client_secret aquí.
+
+// POST /id/apps/:slug/social — crear provider propio del tenant
+// body: { key, name, discoveryUrl, clientId, scope }
+app.post("/id/apps/:slug/social", auth, requireAuth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app) return res.status(404).json({ error: "App no encontrada" });
+    if (app.ownerUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+
+    const { key, name, discoveryUrl, clientId, scope } = req.body;
+    if (!key || !name || !discoveryUrl || !clientId)
+      return res.status(400).json({ error: "key, name, discoveryUrl y clientId son requeridos" });
+
+    let discovery;
+    try {
+      discovery = await fetchOidcDiscovery(discoveryUrl);
+    } catch (e) {
+      return res.status(400).json({ error: "Discovery URL inválida: " + e.message });
+    }
+
+    await database.collection("social_providers_tenant").updateOne(
+      { appSlug: req.params.slug, key },
+      {
+        $set: {
+          appSlug: req.params.slug, key, name, discoveryUrl,
+          authorizationEndpoint: discovery.authorization_endpoint,
+          tokenEndpoint: discovery.token_endpoint,
+          userinfoEndpoint: discovery.userinfo_endpoint || null,
+          clientId,
+          // Nunca clientSecret aquí — PKCE siempre, sin excepción.
+          scope: scope || "openid profile email",
+          enabled: true,
+          updatedAt: new Date()
+        },
+        $setOnInsert: { createdAt: new Date() }
+      },
+      { upsert: true }
+    );
+    res.json({ ok: true, key });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// GET /id/apps/:slug/social — listar providers propios del tenant
+app.get("/id/apps/:slug/social", auth, requireAuth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app) return res.status(404).json({ error: "App no encontrada" });
+    if (app.ownerUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+
+    const providers = await database.collection("social_providers_tenant")
+      .find({ appSlug: req.params.slug }).toArray();
+    res.json(providers);
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// PUT /id/apps/:slug/social/:key — activar/desactivar (propio o un global que el tenant adoptó)
+app.put("/id/apps/:slug/social/:key", auth, requireAuth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app) return res.status(404).json({ error: "App no encontrada" });
+    if (app.ownerUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+
+    const { enabled } = req.body;
+    const tenantProvider = await database.collection("social_providers_tenant")
+      .findOne({ appSlug: req.params.slug, key: req.params.key });
+
+    if (tenantProvider) {
+      await database.collection("social_providers_tenant").updateOne(
+        { _id: tenantProvider._id }, { $set: { enabled: !!enabled } }
+      );
+      return res.json({ ok: true });
+    }
+
+    // Si no es un provider propio, es la activación de un GLOBAL para este tenant
+    await database.collection("id_apps").updateOne(
+      { slug: req.params.slug },
+      enabled
+        ? { $addToSet: { enabledGlobalProviders: req.params.key } }
+        : { $pull: { enabledGlobalProviders: req.params.key } }
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// DELETE /id/apps/:slug/social/:key — elimina un provider propio del tenant
+app.delete("/id/apps/:slug/social/:key", auth, requireAuth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app) return res.status(404).json({ error: "App no encontrada" });
+    if (app.ownerUsername !== req.user.username && req.user.role !== "admin")
+      return res.status(403).json({ error: "Sin permisos" });
+
+    await database.collection("social_providers_tenant")
+      .deleteOne({ appSlug: req.params.slug, key: req.params.key });
+    res.json({ ok: true });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// Resuelve un provider activo (global o de tenant) para un appSlug+key dado.
+// Devuelve { provider, isGlobal } o null.
+async function resolveActiveSocialProvider(database, appSlug, key) {
+  const tenantProvider = await database.collection("social_providers_tenant")
+    .findOne({ appSlug, key, enabled: true });
+  if (tenantProvider) return { provider: tenantProvider, isGlobal: false };
+
+  const app = await database.collection("id_apps").findOne({ slug: appSlug });
+  if (app?.enabledGlobalProviders?.includes(key)) {
+    const globalProvider = await database.collection("social_providers_global")
+      .findOne({ key, enabled: true });
+    if (globalProvider) return { provider: globalProvider, isGlobal: true };
+  }
+  return null;
+}
+
+// GET /id/apps/:slug/social/available — providers activos para el LOGIN
+// (combina los propios del tenant + los globales que activó), sin datos
+// sensibles. Lo usa la hosted login page para mostrar los botones.
+app.get("/id/apps/:slug/social/available", async (req, res) => {
+  try {
+    const database = await getDb();
+    const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+    if (!app) return res.status(404).json({ error: "App no encontrada" });
+
+    const tenantProviders = await database.collection("social_providers_tenant")
+      .find({ appSlug: req.params.slug, enabled: true }, { projection: { name: 1, key: 1 } }).toArray();
+
+    let globalProviders = [];
+    if (app.enabledGlobalProviders?.length) {
+      globalProviders = await database.collection("social_providers_global")
+        .find({ key: { $in: app.enabledGlobalProviders }, enabled: true }, { projection: { name: 1, key: 1 } }).toArray();
+    }
+
+    res.json([
+      ...tenantProviders.map(p => ({ key: p.key, name: p.name })),
+      ...globalProviders.map(p => ({ key: p.key, name: p.name }))
+    ]);
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── Flujo de login social (PKCE siempre hacia el provider) ───────────────────
+
+// GET /id/users/:slug/social/:key/start
+// Redirige al authorization_endpoint del provider. Guarda el code_verifier y
+// los datos OAuth del tenant en una cookie-less "social_login_state" en Mongo
+// (más simple y sin depender de sesión de navegador para el state).
+// query: redirectUri, clientId (del tenant), codeChallenge, codeChallengeMethod, state
+app.get("/id/users/:slug/social/:key/start", async (req, res) => {
+  try {
+    const database = await getDb();
+    const resolved = await resolveActiveSocialProvider(database, req.params.slug, req.params.key);
+    if (!resolved) return res.status(404).send("Provider social no disponible para esta app");
+    const { provider, isGlobal } = resolved;
+
+    const { codeVerifier, codeChallenge } = generatePkcePair();
+    const flowId = crypto.randomBytes(24).toString("hex");
+    const callbackUri = `${NEAT_ID_BASE}/id/users/${req.params.slug}/social/${req.params.key}/callback`;
+
+    await database.collection("social_login_flows").insertOne({
+      flowId,
+      appSlug: req.params.slug,
+      providerKey: req.params.key,
+      codeVerifier,
+      // Datos OAuth del TENANT que originó este login — para emitir su code al volver
+      tenant: {
+        clientId: req.query.clientId || null,
+        redirectUri: req.query.redirectUri || null,
+        codeChallenge: req.query.codeChallenge || null,
+        codeChallengeMethod: req.query.codeChallengeMethod || "S256",
+        state: req.query.state || null
+      },
+      createdAt: new Date(),
+      expiresAt: new Date(Date.now() + 10 * 60 * 1000)
+    });
+
+    const params = new URLSearchParams({
+      response_type: "code",
+      client_id: provider.clientId,
+      redirect_uri: callbackUri,
+      scope: provider.scope || "openid profile email",
+      state: flowId,
+      code_challenge: codeChallenge,
+      code_challenge_method: "S256"
+    });
+    res.redirect(`${provider.authorizationEndpoint}?${params.toString()}`);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Error interno");
+  }
+});
+
+// GET /id/users/:slug/social/:key/callback
+// El provider redirige aquí. Canjea el code, obtiene el perfil, y resuelve la
+// cuenta local — igual patrón que el callback de Neat (/id/callback).
+app.get("/id/users/:slug/social/:key/callback", async (req, res) => {
+  try {
+    const { code, state: flowId } = req.query;
+    if (!code || !flowId) return res.status(400).send("Parámetros faltantes");
+
+    const database = await getDb();
+    const flow = await database.collection("social_login_flows").findOne({ flowId });
+    if (!flow || flow.expiresAt < new Date()) return res.status(400).send("El intento de login expiró, intenta de nuevo");
+
+    const resolved = await resolveActiveSocialProvider(database, req.params.slug, req.params.key);
+    if (!resolved) return res.status(404).send("Provider social no disponible para esta app");
+    const { provider } = resolved;
+
+    const callbackUri = `${NEAT_ID_BASE}/id/users/${req.params.slug}/social/${req.params.key}/callback`;
+
+    // Intercambiar code → access_token. PKCE siempre; client_secret solo si
+    // el provider lo tiene configurado (únicamente posible en globales).
+    const tokenBody = {
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: callbackUri,
+      client_id: provider.clientId,
+      code_verifier: flow.codeVerifier
+    };
+    if (provider.clientSecret) tokenBody.client_secret = provider.clientSecret;
+
+    const tokenRes = await fetch(provider.tokenEndpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(tokenBody)
+    });
+    const tokenData = await tokenRes.json();
+    if (!tokenData.access_token) {
+      console.error("Token endpoint error:", tokenData);
+      return res.status(400).send("No se pudo completar el login con " + provider.name);
+    }
+
+    let profile = {};
+    if (provider.userinfoEndpoint) {
+      const userinfoRes = await fetch(provider.userinfoEndpoint, {
+        headers: { Authorization: `Bearer ${tokenData.access_token}` }
+      });
+      profile = await userinfoRes.json();
+    }
+    const providerSub = profile.sub || profile.id;
+    if (!providerSub) return res.status(400).send("El proveedor no devolvió un identificador de usuario");
+
+    await database.collection("social_login_flows").deleteOne({ _id: flow._id });
+
+    const { tenant } = flow;
+    const client = tenant.clientId
+      ? await database.collection("id_app_clients").findOne({ appSlug: req.params.slug, clientId: tenant.clientId })
+      : await database.collection("id_app_clients").findOne({ appSlug: req.params.slug, isDefault: true });
+    if (!client) return res.status(400).send("client_id inválido para esta app");
+    if (!tenant.redirectUri || !client.redirectUris.includes(tenant.redirectUri))
+      return res.status(400).send("redirect_uri no autorizada para este client");
+
+    const providerIdField = `social_${req.params.key}_sub`;
+
+    let user = await database.collection("id_app_users").findOne({
+      appSlug: req.params.slug,
+      [providerIdField]: providerSub
+    });
+
+    if (!user && profile.email) {
+      // Hay una cuenta local con el mismo email pero sin vincular este
+      // provider todavía. No vinculamos automático — el usuario debe
+      // confirmar con su contraseña local (paso separado, ver
+      // /social/:key/link-existing). Por ahora lo mandamos a esa pantalla.
+      const emailMatch = await database.collection("id_app_users").findOne({
+        appSlug: req.params.slug,
+        email: profile.email.toLowerCase(),
+        [providerIdField]: { $exists: false }
+      });
+      if (emailMatch && emailMatch.passwordHash) {
+        const linkToken = jwt.sign(
+          {
+            type: "social_link_pending", appSlug: req.params.slug,
+            existingUserId: emailMatch._id.toString(),
+            providerKey: req.params.key, providerSub, profileEmail: profile.email,
+            tenant
+          },
+          SECRET, { expiresIn: "10m" }
+        );
+        const params = new URLSearchParams({ link_token: linkToken, email: profile.email });
+        return res.redirect(`/${req.params.slug}?${params.toString()}`);
+      }
+    }
+
+    if (!user) {
+      // Sin cuenta previa → crear una nueva, vinculada a este provider
+      const result = await database.collection("id_app_users").insertOne({
+        appSlug: req.params.slug,
+        email: (profile.email || `${providerSub}@${req.params.key}.social`).toLowerCase(),
+        username: profile.name || profile.preferred_username || profile.email || providerSub,
+        passwordHash: null,
+        [providerIdField]: providerSub,
+        // Entrar con un proveedor social ya es una verificación de identidad
+        // suficiente — nunca se manda correo de verificación para esto,
+        // sin importar el ajuste de verificación obligatoria del tenant.
+        emailVerified: true,
+        suspended: false,
+        createdAt: new Date()
+      });
+      user = await database.collection("id_app_users").findOne({ _id: result.insertedId });
+    }
+
+    if (user.suspended)
+      return res.redirect(`${tenant.redirectUri}?error=access_denied&error_description=${encodeURIComponent("Tu cuenta de esta app está suspendida.")}`);
+
+    const oauthResult = await issueLocalOAuthCode(database, {
+      user, appSlug: req.params.slug, client,
+      redirectUri: tenant.redirectUri,
+      codeChallenge: tenant.codeChallenge,
+      codeChallengeMethod: tenant.codeChallengeMethod,
+      state: tenant.state,
+      type: "id_app_social"
+    });
+    if (oauthResult.error)
+      return res.redirect(`${tenant.redirectUri}?error=invalid_request&error_description=${encodeURIComponent(oauthResult.error)}`);
+
+    // El navegador vuelve directo al tenant (no a esta página), así que el
+    // pageSessionToken no tiene dónde guardarse para "vincular Neat" después
+    // en el mismo flujo — eso es exclusivo de la hosted login page cuando el
+    // login ocurre ahí mismo (local/TOTP). El social login redirige fuera, así
+    // que esa oferta simplemente no aplica aquí; el code y el redirect sí.
+    const params = new URLSearchParams({ code: oauthResult.code });
+    if (oauthResult.state) params.set("state", oauthResult.state);
+    res.redirect(`${oauthResult.redirectUri}?${params.toString()}`);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Error interno");
+  }
+});
+
+// POST /id/users/:slug/social/link-existing
+// Confirma con la contraseña LOCAL de la cuenta existente que el usuario es
+// quien dice ser, y vincula el provider social a esa cuenta.
+// body: { link_token, password }
+app.post("/id/users/:slug/social/link-existing", async (req, res) => {
+  try {
+    const { link_token, password } = req.body;
+    if (!link_token || !password) return res.status(400).json({ error: "link_token y password requeridos" });
+
+    let payload;
+    try { payload = jwt.verify(link_token, SECRET); }
+    catch { return res.status(401).json({ error: "El enlace de vinculación expiró, inicia el login de nuevo" }); }
+    if (payload.type !== "social_link_pending" || payload.appSlug !== req.params.slug)
+      return res.status(401).json({ error: "Token inválido para esta app" });
+
+    const database = await getDb();
+    const user = await database.collection("id_app_users").findOne({ _id: new ObjectId(payload.existingUserId) });
+    if (!user) return res.status(404).json({ error: "Cuenta no encontrada" });
+
+    const valid = await bcrypt.compare(password, user.passwordHash || "");
+    if (!valid) return res.status(401).json({ error: "Contraseña incorrecta" });
+    if (user.suspended) return res.status(403).json({ error: "Cuenta suspendida en esta app" });
+
+    const providerIdField = `social_${payload.providerKey}_sub`;
+    await database.collection("id_app_users").updateOne(
+      { _id: user._id },
+      { $set: { [providerIdField]: payload.providerSub, emailVerified: true } }
+    );
+
+    const client = payload.tenant.clientId
+      ? await database.collection("id_app_clients").findOne({ appSlug: req.params.slug, clientId: payload.tenant.clientId })
+      : await database.collection("id_app_clients").findOne({ appSlug: req.params.slug, isDefault: true });
+    if (!client) return res.status(400).json({ error: "client_id inválido para esta app" });
+
+    const result = await issueLocalOAuthCode(database, {
+      user, appSlug: req.params.slug, client,
+      redirectUri: payload.tenant.redirectUri,
+      codeChallenge: payload.tenant.codeChallenge,
+      codeChallengeMethod: payload.tenant.codeChallengeMethod,
+      state: payload.tenant.state,
+      type: "id_app_social"
+    });
+    if (result.error) return res.status(400).json({ error: result.error });
+
+    res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno" });
   }
 });
 
