@@ -4425,7 +4425,13 @@ app.get("/id/callback", async (req, res) => {
         }}
       );
     } else {
-      // Primer login con Neat en esta app → crear usuario local vinculado
+      // Primer login con Neat en esta app → crear usuario nuevo, salvo que
+      // el tenant tenga los registros cerrados. El flujo de invitaciones es
+      // exclusivo del registro local (email/password); "Continuar con Neat"
+      // no tiene forma de llevar un inviteToken, así que aquí no hay excepción.
+      if (app.registrationsOpen === false) {
+        return res.redirect(`${redirectUri}?error=access_denied&error_description=${encodeURIComponent("Los registros están cerrados para esta aplicación. Necesitas que un administrador te invite o cree tu cuenta.")}`);
+      }
       const result = await database.collection("id_app_users").insertOne({
         appSlug,
         email: neatUser.email || `${neatUser.username}@neat.qzz.io`,
@@ -6619,7 +6625,14 @@ app.get("/id/users/:slug/social/:key/callback", async (req, res) => {
     }
 
     if (!user) {
-      // Sin cuenta previa → crear una nueva, vinculada a este provider
+      // Sin cuenta previa → crear una nueva, vinculada a este provider, salvo
+      // que el tenant tenga los registros cerrados. Igual que con "Continuar
+      // con Neat", el login social no tiene forma de llevar un inviteToken,
+      // así que aquí tampoco hay excepción por invitación.
+      const app = await database.collection("id_apps").findOne({ slug: req.params.slug });
+      if (app && app.registrationsOpen === false) {
+        return res.redirect(`${tenant.redirectUri}?error=access_denied&error_description=${encodeURIComponent("Los registros están cerrados para esta aplicación. Necesitas que un administrador te invite o cree tu cuenta.")}`);
+      }
       const result = await database.collection("id_app_users").insertOne({
         appSlug: req.params.slug,
         email: (profile.email || `${providerSub}@${req.params.key}.social`).toLowerCase(),
