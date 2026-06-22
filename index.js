@@ -4114,7 +4114,7 @@ app.get("/id/callback", async (req, res) => {
     let appUserId;
     if (existingUser) {
       if (existingUser.suspended)
-        return res.redirect(`${redirectUri}?error=access_denied&error_description=${encodeURIComponent("Tu cuenta de Neat está suspendida")}`);
+        return res.redirect(`${redirectUri}?error=access_denied&error_description=${encodeURIComponent("Tu cuenta de esta app está suspendida, contacta el administrador de esta app para más información.")}`);
       appUserId = existingUser._id.toString();
       // El perfil LOCAL manda siempre que el usuario tenga password local —
       // nunca pisamos su username/email con los de Neat global, o lo dejamos
