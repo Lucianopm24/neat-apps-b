@@ -3719,6 +3719,8 @@ app.get("/id/apps/:slug/public", async (req, res) => {
       appKey: app.appKey,
       requireEmailVerification: !!app.requireEmailVerification,
       registrationsOpen: app.registrationsOpen !== false,
+      kvLimitBytes: kvPrivateLimitForApp(app),
+      kvPublicLimitBytes: kvPublicLimitForApp(app),
       clientName
     });
   } catch {
@@ -5024,9 +5026,11 @@ app.delete("/id/users/:slug/link-neat", async (req, res) => {
 // KV STORAGE — para que apps SIN backend tengan persistencia de datos
 // ══════════════════════════════════════════════════════════════════════════════
 // Dos espacios de almacenamiento por Tenant:
-//   - id_app_user_kv:   un blob JSON por usuario (privado, max 25KB)
+//   - id_app_user_kv:   un blob JSON por usuario (privado, límite configurable
+//                       por tenant — ver kvPrivateLimitForApp más abajo)
 //   - id_app_public_kv: un blob JSON por app (público en LECTURA, cualquiera
-//                       lo lee sin auth — pero solo el BACKEND puede escribirlo)
+//                       lo lee sin auth — pero solo el BACKEND puede escribirlo;
+//                       límite configurable por separado — ver kvPublicLimitForApp)
 //
 // MODELO DE CONFIANZA (igual que la "anon key" + RLS de Supabase):
 //   La App Key (pública, va en el navegador) NUNCA es suficiente por sí sola
@@ -5048,10 +5052,29 @@ app.delete("/id/users/:slug/link-neat", async (req, res) => {
 //   dato de todos, no solo el suyo. Si tu app no tiene backend, este storage
 //   es de solo lectura para ella.
 
-const KV_MAX_BYTES = 25 * 1024; // 25KB por usuario
+const KV_PRIVATE_DEFAULT_BYTES = 25 * 1024;       // 25KB por usuario — default si el tenant no configuró nada
+const KV_PRIVATE_HARD_CAP_BYTES = 1024 * 1024;     // 1MB por usuario — techo absoluto
 
-function kvSizeOk(value) {
-  return Buffer.byteLength(JSON.stringify(value ?? {}), "utf8") <= KV_MAX_BYTES;
+// El público es UN solo blob por tenant (no se multiplica por usuario como el
+// privado), así que puede tener un presupuesto más grande sin que el riesgo
+// crezca con la cantidad de usuarios.
+const KV_PUBLIC_DEFAULT_BYTES = 100 * 1024;        // 100KB — default si el tenant no configuró nada
+const KV_PUBLIC_HARD_CAP_BYTES = 5 * 1024 * 1024;  // 5MB — techo absoluto
+
+function kvPrivateLimitForApp(app) {
+  return (typeof app?.kvLimitBytes === "number" && app.kvLimitBytes > 0)
+    ? app.kvLimitBytes
+    : KV_PRIVATE_DEFAULT_BYTES;
+}
+
+function kvPublicLimitForApp(app) {
+  return (typeof app?.kvPublicLimitBytes === "number" && app.kvPublicLimitBytes > 0)
+    ? app.kvPublicLimitBytes
+    : KV_PUBLIC_DEFAULT_BYTES;
+}
+
+function kvSizeOk(value, limitBytes) {
+  return Buffer.byteLength(JSON.stringify(value ?? {}), "utf8") <= (limitBytes ?? KV_PRIVATE_DEFAULT_BYTES);
 }
 
 // Resuelve quién está escribiendo el KV privado: o un usuario autenticado
@@ -5165,8 +5188,9 @@ app.put("/id/apps/:slug/kv/:userId", kvUserAuth, async (req, res) => {
 
     const { data } = req.body;
     if (data === undefined) return res.status(400).json({ error: "data requerido" });
-    if (!kvSizeOk(data))
-      return res.status(413).json({ error: `data excede el límite de ${KV_MAX_BYTES / 1024}KB por usuario` });
+    const limitBytes = kvPrivateLimitForApp(req.kvApp);
+    if (!kvSizeOk(data, limitBytes))
+      return res.status(413).json({ error: `data excede el límite de ${Math.round(limitBytes / 1024)}KB por usuario` });
 
     const database = await getDb();
     await database.collection("id_app_user_kv").updateOne(
@@ -5209,8 +5233,9 @@ app.post("/id/apps/:slug/kv/:userId/items", kvUserAuth, async (req, res) => {
       : { id: itemId, value: item };
 
     const newData = { ...currentData, [field]: [...currentArray, newItem] };
-    if (!kvSizeOk(newData))
-      return res.status(413).json({ error: `data excede el límite de ${KV_MAX_BYTES / 1024}KB por usuario` });
+    const limitBytes = kvPrivateLimitForApp(req.kvApp);
+    if (!kvSizeOk(newData, limitBytes))
+      return res.status(413).json({ error: `data excede el límite de ${Math.round(limitBytes / 1024)}KB por usuario` });
 
     await database.collection("id_app_user_kv").updateOne(
       { appSlug: req.params.slug, userId: req.params.userId },
@@ -5303,8 +5328,9 @@ app.put("/id/apps/:slug/public-kv", async (req, res) => {
 
     const { data } = req.body;
     if (data === undefined) return res.status(400).json({ error: "data requerido" });
-    if (!kvSizeOk(data))
-      return res.status(413).json({ error: `data excede el límite de ${KV_MAX_BYTES / 1024}KB` });
+    const limitBytes = kvPublicLimitForApp(app);
+    if (!kvSizeOk(data, limitBytes))
+      return res.status(413).json({ error: `data excede el límite de ${Math.round(limitBytes / 1024)}KB` });
 
     await database.collection("id_app_public_kv").updateOne(
       { appSlug: req.params.slug },
@@ -6030,6 +6056,63 @@ app.put("/id/apps/:slug/registrations", tenantAuth, async (req, res) => {
       { $set: { registrationsOpen: open } }
     );
     res.json({ ok: true, registrationsOpen: open });
+  } catch {
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ── LÍMITE DE KV STORAGE POR TENANT ───────────────────────────────────────────
+// PUT /id/apps/:slug/kv-limit
+// El dueño del tenant ajusta el espacio de KV de su tenant. Son dos límites
+// independientes porque tienen naturaleza distinta:
+//   - limitKb       → KV privado, POR USUARIO (id_app_user_kv).
+//                     Default: KV_PRIVATE_DEFAULT_BYTES (25KB). Techo: KV_PRIVATE_HARD_CAP_BYTES (1MB).
+//   - publicLimitKb → KV público, UN SOLO blob por tenant (id_app_public_kv).
+//                     No se multiplica por usuario, así que puede ser más generoso.
+//                     Default: KV_PUBLIC_DEFAULT_BYTES (100KB). Techo: KV_PUBLIC_HARD_CAP_BYTES (5MB).
+// Ninguno de los dos techos se puede pasar — protegen contra abuso/costos
+// descontrolados a nivel de toda la plataforma, no solo de este tenant.
+// body: { limitKb?: number, publicLimitKb?: number } — al menos uno de los dos.
+// Los números van en KB (más cómodo desde el frontend); se guardan en bytes.
+app.put("/id/apps/:slug/kv-limit", tenantAuth, async (req, res) => {
+  try {
+    if (req.idApp.slug !== req.params.slug)
+      return res.status(403).json({ error: "Credenciales no corresponden a esta app" });
+
+    const { limitKb, publicLimitKb } = req.body;
+    if (limitKb === undefined && publicLimitKb === undefined)
+      return res.status(400).json({ error: "Manda limitKb y/o publicLimitKb" });
+
+    const $set = {};
+
+    if (limitKb !== undefined) {
+      const limitBytes = Number(limitKb) * 1024;
+      if (!Number.isFinite(limitBytes) || limitBytes <= 0)
+        return res.status(400).json({ error: "limitKb debe ser un número positivo" });
+      if (limitBytes > KV_PRIVATE_HARD_CAP_BYTES)
+        return res.status(400).json({ error: `limitKb no puede superar ${KV_PRIVATE_HARD_CAP_BYTES / 1024}KB` });
+      $set.kvLimitBytes = Math.round(limitBytes);
+    }
+
+    if (publicLimitKb !== undefined) {
+      const publicLimitBytes = Number(publicLimitKb) * 1024;
+      if (!Number.isFinite(publicLimitBytes) || publicLimitBytes <= 0)
+        return res.status(400).json({ error: "publicLimitKb debe ser un número positivo" });
+      if (publicLimitBytes > KV_PUBLIC_HARD_CAP_BYTES)
+        return res.status(400).json({ error: `publicLimitKb no puede superar ${KV_PUBLIC_HARD_CAP_BYTES / 1024}KB` });
+      $set.kvPublicLimitBytes = Math.round(publicLimitBytes);
+    }
+
+    const database = await getDb();
+    await database.collection("id_apps").updateOne(
+      { slug: req.params.slug },
+      { $set }
+    );
+    res.json({
+      ok: true,
+      kvLimitBytes: $set.kvLimitBytes ?? req.idApp.kvLimitBytes ?? KV_PRIVATE_DEFAULT_BYTES,
+      kvPublicLimitBytes: $set.kvPublicLimitBytes ?? req.idApp.kvPublicLimitBytes ?? KV_PUBLIC_DEFAULT_BYTES
+    });
   } catch {
     res.status(500).json({ error: "Error interno" });
   }
