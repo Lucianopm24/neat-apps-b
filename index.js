@@ -3782,7 +3782,7 @@ app.get("/id/users/:slug/verify-email", async (req, res) => {
     );
 
     // Redirigir a la página de login de la app con mensaje de éxito
-    res.redirect(`https://id.neat.qzz.io/${req.params.slug}?verified=1`);
+    res.redirect(`https://neat.qzz.io/verified?verified=1&redirect_uri=`);
   } catch (err) {
     console.error(err);
     res.status(500).send("Error interno");
