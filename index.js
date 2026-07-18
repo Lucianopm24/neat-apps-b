@@ -7075,12 +7075,17 @@ app.post("/agents/internal/nudge", internalAuth, async (req, res) => {
     if (!user?.ntfyTopic)
       return res.status(404).json({ success: false, error: { code: "NO_NTFY", message: "Este humano no tiene notificaciones activadas.", fix: "El humano debe activar Ntfy en su app (actualmente requiere Neat Plus)." } });
 
-    const nr = await fetch(`https://ntfy.sh/${user.ntfyTopic}`, {
+    // El topic vive en el mismo servidor ntfy que usa el resto de la app (push.tchncs.de).
+    // NTFY_BASE permite apuntar a otro servidor self-hosted sin tocar código.
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(user.ntfyTopic))
+      return res.status(500).json({ success: false, error: { code: "BAD_TOPIC", message: "ntfyTopic con formato inesperado.", fix: "Re-genera el topic con /ntfy/setup." } });
+    const ntfyBase = (process.env.NTFY_BASE || "https://push.tchncs.de").replace(/\/+$/, "");
+    const nr = await fetch(`${ntfyBase}/${user.ntfyTopic}`, {
       method: "POST",
       headers: { "Title": `🦞 Agente de ${username}`, "Tags": "robot,neat" },
       body: text,
     });
-    if (!nr.ok) return res.status(502).json({ success: false, error: { code: "NTFY_ERROR", message: "ntfy.sh respondió error.", fix: "Reintenta en unos segundos." } });
+    if (!nr.ok) return res.status(502).json({ success: false, error: { code: "NTFY_ERROR", message: "El servidor ntfy respondió error.", fix: "Reintenta en unos segundos." } });
 
     await database.collection("agent_nudges").insertOne({ username, message: text, via: "agent", createdAt: new Date() });
     res.json({ success: true, tip: "Nudge entregado a tu humano 📣" });
