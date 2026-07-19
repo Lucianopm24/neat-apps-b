@@ -7092,4 +7092,90 @@ app.post("/agents/internal/nudge", internalAuth, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ success: false, error: { code: "INTERNAL", message: "Error interno.", fix: "Reintenta con backoff." } }); }
 });
 
+// ── Chatter para agentes (puerta del gateway scope chatter, v0.3) ──
+// Emula el modelo humano existente: chats.participants=[usernames], messages.chatId=string.
+// Reglas: provenance siempre (via:"agent" + prefijo 🦞 visible en cualquier cliente),
+// membership estricta, y reutiliza notifyParticipants (push ntfy/web-push ya existente).
+
+app.get("/agents/internal/chatter/chats", internalAuth, async (req, res) => {
+  try {
+    const username = agentUser(req);
+    if (!username) return res.status(400).json({ success: false, error: { code: "BAD_AGENT_USER", message: "X-Agent-User inválido.", fix: "Header requerido." } });
+    const database = await getDb();
+    const chats = await database.collection("chats")
+      .find({ participants: username })
+      .sort({ updatedAt: -1 }).limit(50).toArray();
+    res.json({ success: true, data: chats.map((c) => ({
+      chatId: String(c._id), name: c.name, type: c.type,
+      participants: c.participants, lastMessage: c.lastMessage || null, updatedAt: c.updatedAt,
+    })), tip: chats.length ? "Usa GET /chats/{chatId}/messages?since= para leer lo nuevo." : "Sin chats aún. Tu humano puede crear uno en la app de Chatter." });
+  } catch (e) { console.error(e); res.status(500).json({ success: false, error: { code: "INTERNAL", message: "Error interno.", fix: "Reintenta con backoff." } }); }
+});
+
+app.get("/agents/internal/chatter/chats/:id/messages", internalAuth, async (req, res) => {
+  try {
+    const username = agentUser(req);
+    if (!username) return res.status(400).json({ success: false, error: { code: "BAD_AGENT_USER", message: "X-Agent-User inválido.", fix: "Header requerido." } });
+    if (!/^[0-9a-f]{24}$/i.test(req.params.id))
+      return res.status(400).json({ success: false, error: { code: "BAD_CHAT_ID", message: "chatId inválido.", fix: "Usa el chatId de GET /api/v1/chats." } });
+    let since = null;
+    if (req.query.since) {
+      since = new Date(req.query.since);
+      if (isNaN(since)) return res.status(400).json({ success: false, error: { code: "BAD_SINCE", message: "since inválido.", fix: "ISO-8601, ej: ?since=2026-07-18T00:00:00Z" } });
+    }
+    const database = await getDb();
+    const chat = await database.collection("chats").findOne({ _id: new ObjectId(req.params.id) });
+    if (!chat) return res.status(404).json({ success: false, error: { code: "CHAT_NOT_FOUND", message: "Chat no encontrado.", fix: "Lista con GET /api/v1/chats." } });
+    if (!chat.participants.includes(username))
+      return res.status(403).json({ success: false, error: { code: "NOT_MEMBER", message: "Tu humano no participa en este chat.", fix: "El humano debe añadirse desde Chatter." } });
+    const q = { chatId: req.params.id };
+    if (since) q.createdAt = { $gt: since };
+    const messages = await database.collection("messages").find(q).sort({ createdAt: -1 }).limit(50).toArray();
+    res.json({ success: true, data: messages.reverse().map((m) => ({
+      messageId: String(m._id), sender: m.senderUsername, via: m.via || "human",
+      content: m.content, type: m.type, createdAt: m.createdAt,
+    })), tip: "Guarda el createdAt del último mensaje y úsalo como ?since= la próxima vez." });
+  } catch (e) { console.error(e); res.status(500).json({ success: false, error: { code: "INTERNAL", message: "Error interno.", fix: "Reintenta con backoff." } }); }
+});
+
+app.post("/agents/internal/chatter/chats/:id/messages", internalAuth, async (req, res) => {
+  try {
+    const username = agentUser(req);
+    if (!username) return res.status(400).json({ success: false, error: { code: "BAD_AGENT_USER", message: "X-Agent-User inválido.", fix: "Header requerido." } });
+    const { text } = req.body || {};
+    if (!text || typeof text !== "string" || !text.trim())
+      return res.status(400).json({ success: false, error: { code: "NO_MESSAGE", message: "text requerido (string).", fix: "Envía {text: 'mensaje'} (máx 1000 chars)." } });
+    if (!/^[0-9a-f]{24}$/i.test(req.params.id))
+      return res.status(400).json({ success: false, error: { code: "BAD_CHAT_ID", message: "chatId inválido.", fix: "Usa el chatId de GET /api/v1/chats." } });
+    const database = await getDb();
+    const chat = await database.collection("chats").findOne({ _id: new ObjectId(req.params.id) });
+    if (!chat) return res.status(404).json({ success: false, error: { code: "CHAT_NOT_FOUND", message: "Chat no encontrado.", fix: "Lista con GET /api/v1/chats." } });
+    if (!chat.participants.includes(username))
+      return res.status(403).json({ success: false, error: { code: "NOT_MEMBER", message: "Tu humano no participa en este chat.", fix: "El humano debe añadirse desde Chatter." } });
+
+    // Prefijo visible para que CUALQUIER cliente (actual o viejo) distinga al agente.
+    const content = "🦞 " + text.trim().slice(0, 1000);
+    const message = {
+      chatId: req.params.id,
+      senderId: username,
+      senderUsername: username,
+      content,
+      type: "text",
+      telegramFileId: null,
+      mimeType: null,
+      via: "agent",                     // provenance estructurada (para UIs futuras)
+      createdAt: new Date(),
+    };
+    const result = await database.collection("messages").insertOne(message);
+    await database.collection("chats").updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { updatedAt: new Date(), lastMessage: content } }
+    );
+    const saved = { _id: result.insertedId, ...message };
+    notifyParticipants(database, req.params.id, saved, username); // push gratis al otro participante
+    res.status(201).json({ success: true, data: { messageId: String(result.insertedId), chatId: req.params.id, createdAt: message.createdAt },
+      tip: "Mensaje entregado con etiqueta 🦞. Si el otro participante tiene notificaciones, ya le sonó el teléfono 🔔" });
+  } catch (e) { console.error(e); res.status(500).json({ success: false, error: { code: "INTERNAL", message: "Error interno.", fix: "Reintenta con backoff." } }); }
+});
+
 module.exports = app;
