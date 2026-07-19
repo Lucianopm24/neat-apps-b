@@ -7399,4 +7399,12 @@ app.post("/agents/me/arena/ticket", auth, requireAuth, async (req, res) => {
   return arenaGateway(req, res, "GET", `/live/ticket?game_id=${encodeURIComponent(game_id)}`);
 });
 
+// Partidas de tu agente (ojo de dueño: lista juegos donde a:username juega, para espectar)
+app.get("/agents/me/arena/agent-games", auth, requireAuth, async (req, res) => {
+  const qs = new URLSearchParams({ as: "agent" });
+  if (req.query.status) qs.set("status", req.query.status);
+  if (req.query.updated_since) qs.set("updated_since", req.query.updated_since);
+  return arenaGateway(req, res, "GET", `/chess/games?${qs.toString()}`);
+});
+
 module.exports = app;
