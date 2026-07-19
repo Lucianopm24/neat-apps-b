@@ -7247,4 +7247,69 @@ app.get("/agents/me/audit", auth, requireAuth, async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ success: false, error: { code: "INTERNAL", message: "Error interno.", fix: "Recarga en unos segundos." } }); }
 });
 
+// ── Artefactos del agente — cara humana (R3, v0.6) ───────────────────────────
+// El humano ve y borra los archivos que subió SU agente (bóveda 1GB / 25GB Plus)
+// y pide links firmados de descarga: los bytes NUNCA pasan por Vercel (límite de
+// body); el link lo sirve el Worker directo — el bot token jamás sale del Worker.
+// El estado Plus se sincroniza al gateway en cada lectura (self-healing, idempotente).
+
+// Misma lógica Plus que /watch/upload-auth: admin = plus forever; si expiró, se apaga en Mongo.
+async function myNeatPlusStatus(database, username, role) {
+  if (role === "admin") return true;
+  const user = await database.collection("users").findOne(
+    { username }, { projection: { neatPlus: 1, neatPlusExpiresAt: 1 } }
+  );
+  const expired = user?.neatPlusExpiresAt && new Date() > new Date(user.neatPlusExpiresAt);
+  if (expired) {
+    await database.collection("users").updateOne({ username }, { $set: { neatPlus: false } });
+  }
+  return expired ? false : !!user?.neatPlus;
+}
+
+app.get("/agents/me/artifacts", auth, requireAuth, async (req, res) => {
+  try {
+    const database = await getDb();
+    const plus = await myNeatPlusStatus(database, req.user.username, req.user.role);
+    // Sincronizar plan al gateway (si falla, no rompemos la lectura: se reintenta en la próxima)
+    fetch(`${AGENTS_WORKER_URL}/admin/keys/plus`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-neat-internal": process.env.NEAT_INTERNAL_SECRET || "" },
+      body: JSON.stringify({ username: req.user.username, plus }),
+    }).catch(() => {});
+    const r = await fetch(`${AGENTS_WORKER_URL}/admin/artifacts?username=${encodeURIComponent(req.user.username)}`, {
+      headers: { "x-neat-internal": process.env.NEAT_INTERNAL_SECRET || "" },
+    });
+    const j = await r.json().catch(() => null);
+    if (!r.ok || !j?.success) return res.status(502).json({ success: false, error: { code: "WORKER_ERROR", message: "El gateway de agentes respondió error.", fix: "Reintenta en unos segundos." } });
+    res.json({ success: true, artifacts: j.data || [], storage: j.storage || null,
+      tip: "Estos son los archivos que tu agente ha guardado. Puedes descargarlos o borrarlos para liberar tu bóveda." });
+  } catch (e) { console.error("[agents/me/artifacts]", e.message); res.status(502).json({ success: false, error: { code: "WORKER_UNREACHABLE", message: "No se pudo contactar el gateway.", fix: "Reintenta en unos segundos." } }); }
+});
+
+app.post("/agents/me/artifacts/:id/link", auth, requireAuth, async (req, res) => {
+  try {
+    const r = await fetch(`${AGENTS_WORKER_URL}/admin/artifacts/${encodeURIComponent(req.params.id)}/token`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-neat-internal": process.env.NEAT_INTERNAL_SECRET || "" },
+      body: JSON.stringify({ username: req.user.username }),
+    });
+    const j = await r.json().catch(() => null);
+    if (!r.ok || !j?.success) return res.status(r.status === 404 ? 404 : 502).json(j || { success: false, error: { code: "WORKER_ERROR", message: "Respuesta inválida del gateway.", fix: "Reintenta." } });
+    res.json({ success: true, url: j.data.url, expires_in: j.data.expires_in,
+      tip: "Abre el link ya: dura 5 minutos y solo sirve para este archivo." });
+  } catch (e) { console.error("[agents/me/artifacts/link]", e.message); res.status(502).json({ success: false, error: { code: "WORKER_UNREACHABLE", message: "No se pudo contactar el gateway.", fix: "Reintenta en unos segundos." } }); }
+});
+
+app.delete("/agents/me/artifacts/:id", auth, requireAuth, async (req, res) => {
+  try {
+    const r = await fetch(`${AGENTS_WORKER_URL}/admin/artifacts/${encodeURIComponent(req.params.id)}?username=${encodeURIComponent(req.user.username)}`, {
+      method: "DELETE",
+      headers: { "x-neat-internal": process.env.NEAT_INTERNAL_SECRET || "" },
+    });
+    const j = await r.json().catch(() => null);
+    if (!r.ok || !j?.success) return res.status(r.status === 404 ? 404 : 502).json(j || { success: false, error: { code: "WORKER_ERROR", message: "Respuesta inválida del gateway.", fix: "Reintenta." } });
+    res.json(j);
+  } catch (e) { console.error("[agents/me/artifacts/delete]", e.message); res.status(502).json({ success: false, error: { code: "WORKER_UNREACHABLE", message: "No se pudo contactar el gateway.", fix: "Reintenta en unos segundos." } }); }
+});
+
 module.exports = app;
