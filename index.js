@@ -7312,4 +7312,91 @@ app.delete("/agents/me/artifacts/:id", auth, requireAuth, async (req, res) => {
   } catch (e) { console.error("[agents/me/artifacts/delete]", e.message); res.status(502).json({ success: false, error: { code: "WORKER_UNREACHABLE", message: "No se pudo contactar el gateway.", fix: "Reintenta en unos segundos." } }); }
 });
 
+// ── Neat Arena (v0.7) — cara humana del ajedrez para agentes ─────────────────
+// El humano juega CONTRA agentes (¡incluido el suyo!) con su username Neat.
+// Mismo patrón que artifacts: aquí validamos JWT (requireAuth) y llamamos al
+// gateway con secreto interno + ?username=. El estado vive en el Worker/D1.
+// Credencial del bot/motor jamás pasa por Vercel: solo proxy JSON.
+
+// Helper único: proxy → /admin/arena/<sub>?username=<u> con el mismo estilo de errores
+async function arenaGateway(req, res, method, sub, body) {
+  try {
+    const qs = (sub.includes("?") ? "&" : "?") + "username=" + encodeURIComponent(req.user.username);
+    const r = await fetch(`${AGENTS_WORKER_URL}/admin/arena${sub}${qs}`, {
+      method,
+      headers: { "content-type": "application/json", "x-neat-internal": process.env.NEAT_INTERNAL_SECRET || "" },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    const j = await r.json().catch(() => null);
+    if (!j) return res.status(502).json({ success: false, error: { code: "WORKER_ERROR", message: "Respuesta inválida del gateway de agentes.", fix: "Reintenta en unos segundos." } });
+    return res.status(r.status).json(j);
+  } catch (e) {
+    console.error("[arena proxy]", e.message);
+    return res.status(502).json({ success: false, error: { code: "WORKER_UNREACHABLE", message: "No se pudo contactar la Arena.", fix: "Reintenta en unos segundos." } });
+  }
+}
+
+app.post("/agents/me/arena/challenge", auth, requireAuth, async (req, res) => {
+  const { opponent, color, mode } = req.body || {};
+  if (typeof opponent !== "string" || !opponent.trim())
+    return res.status(400).json({ success: false, error: { code: "BAD_JSON", message: 'Envía {"opponent":"NombreAgente"|"open", "color":"w"|"b"|"auto", "mode":"corr"|"live"}.', fix: "Reta a un agente concreto o deja un reto abierto." } });
+  return arenaGateway(req, res, "POST", "/chess/challenge", { opponent: opponent.trim(), color: color || "auto", mode: mode || "corr" });
+});
+
+app.post("/agents/me/arena/accept", auth, requireAuth, async (req, res) => {
+  const { game_id } = req.body || {};
+  if (!game_id) return res.status(400).json({ success: false, error: { code: "BAD_JSON", message: 'Envía {"game_id":"g_..."}.', fix: "Lista retos abiertos con GET /agents/me/arena/open." } });
+  return arenaGateway(req, res, "POST", "/chess/accept", { game_id });
+});
+
+app.get("/agents/me/arena/open", auth, requireAuth, async (req, res) => arenaGateway(req, res, "GET", "/chess/open"));
+
+app.get("/agents/me/arena/games", auth, requireAuth, async (req, res) => {
+  const qs = new URLSearchParams();
+  if (req.query.turn) qs.set("turn", req.query.turn);
+  if (req.query.status) qs.set("status", req.query.status);
+  if (req.query.updated_since) qs.set("updated_since", req.query.updated_since);
+  const tail = qs.toString() ? "?" + qs.toString() : "";
+  return arenaGateway(req, res, "GET", "/chess/games" + tail);
+});
+
+app.get("/agents/me/arena/games/:id", auth, requireAuth, async (req, res) => {
+  const full = req.query.full === "1" ? "?full=1" : "";
+  return arenaGateway(req, res, "GET", `/chess/games/${encodeURIComponent(req.params.id)}${full}`);
+});
+
+app.post("/agents/me/arena/games/:id/move", auth, requireAuth, async (req, res) => {
+  const { move, ply, offer } = req.body || {};
+  if (typeof move !== "string" || !move)
+    return res.status(400).json({ success: false, error: { code: "BAD_JSON", message: 'Envía {"move":"e2e4"} (UCI; promoción "e7e8q").', fix: "Arrastra la pieza o escribe la jugada en UCI." } });
+  return arenaGateway(req, res, "POST", `/chess/games/${encodeURIComponent(req.params.id)}/move`, { move, ply, offer: !!offer });
+});
+
+app.post("/agents/me/arena/games/:id/resign", auth, requireAuth, async (req, res) =>
+  arenaGateway(req, res, "POST", `/chess/games/${encodeURIComponent(req.params.id)}/resign`, {}));
+
+app.post("/agents/me/arena/games/:id/draw", auth, requireAuth, async (req, res) => {
+  const { action } = req.body || {};
+  if (!["offer", "accept", "decline"].includes(action))
+    return res.status(400).json({ success: false, error: { code: "BAD_JSON", message: 'Envía {"action":"offer|accept|decline"}.', fix: "Solo esas tres acciones." } });
+  return arenaGateway(req, res, "POST", `/chess/games/${encodeURIComponent(req.params.id)}/draw`, { action });
+});
+
+app.get("/agents/me/arena/notifications", auth, requireAuth, async (req, res) => {
+  const since = parseInt(req.query.since_id || "0", 10) || 0;
+  return arenaGateway(req, res, "GET", `/notifications?since_id=${since}`);
+});
+
+app.get("/agents/me/arena/leaderboard", auth, requireAuth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit || "20", 10) || 20, 100);
+  return arenaGateway(req, res, "GET", `/chess/leaderboard?limit=${limit}`);
+});
+
+// Ticket para el vivo (WSS al WORKER directo: la conexión no pasa por Vercel 🚀)
+app.post("/agents/me/arena/ticket", auth, requireAuth, async (req, res) => {
+  const { game_id } = req.body || {};
+  if (!game_id) return res.status(400).json({ success: false, error: { code: "BAD_JSON", message: 'Envía {"game_id":"g_..."}.', fix: "El id viene en tu lista de partidas." } });
+  return arenaGateway(req, res, "GET", `/live/ticket?game_id=${encodeURIComponent(game_id)}`);
+});
+
 module.exports = app;
