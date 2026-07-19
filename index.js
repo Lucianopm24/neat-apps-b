@@ -120,8 +120,16 @@ app.post("/auth/login", (req, res) => {
 });
 
 // ── Auth usuarios normales ─────────────────────────────────────────────────────
-app.post("/chat/register", async (req, res) => {
+// Registro de usuarios de la plataforma (role "user").
+// R2: endpoint público ÚNICO montado en /auth/register (nombre semántico para la Play)
+// y mantenido en /chat/register por compatibilidad con la app Chatter actual.
+// Defensas: honeypot "website" (bots) + rate limit 5 registros/IP/hora (register_attempts).
+async function registerHandler(req, res) {
   try {
+    // Honeypot: los humanos nunca ven este campo en la UI; si viene lleno = bot.
+    // Respondemos éxito falso para no enseñarles nada. Silencio y a otra cosa.
+    if (req.body?.website) return res.status(201).json({ ok: true });
+
     const { username, password } = req.body;
     if (!username || !password)
       return res.status(400).json({ error: "username y password requeridos" });
@@ -137,7 +145,19 @@ app.post("/chat/register", async (req, res) => {
     if (username.toLowerCase() === ADMIN_USER.toLowerCase())
       return res.status(400).json({ error: "Username no disponible" });
 
+    // Rate limit por IP: máx 5 registros por hora (registro público sin captcha aún)
+    const ip = String(
+      req.headers["cf-connecting-ip"] ||
+      (req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
+      req.ip || "unknown"
+    ).slice(0, 64);
     const database = await getDb();
+    const sinceHour = new Date(Date.now() - 60 * 60 * 1000);
+    const recent = await database.collection("register_attempts").countDocuments({ ip, at: { $gt: sinceHour } });
+    if (recent >= 5)
+      return res.status(429).json({ error: "Demasiados registros desde esta red. Intenta en una hora." });
+    await database.collection("register_attempts").insertOne({ ip, at: new Date() });
+
     const exists = await database.collection("users").findOne({
       username: { $regex: new RegExp(`^${username}$`, "i") }
     });
@@ -165,7 +185,9 @@ app.post("/chat/register", async (req, res) => {
     console.error(err);
     res.status(500).json({ error: "Error interno" });
   }
-});
+}
+app.post("/auth/register", registerHandler);
+app.post("/chat/register", registerHandler); // compat: la app Chatter lo llama hoy
 
 
 webpush.setVapidDetails(
