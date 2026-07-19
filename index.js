@@ -7181,4 +7181,48 @@ app.post("/agents/internal/chatter/chats/:id/messages", internalAuth, async (req
   } catch (e) { console.error(e); res.status(500).json({ success: false, error: { code: "INTERNAL", message: "Error interno.", fix: "Reintenta con backoff." } }); }
 });
 
+// ── Audit trail (v0.4 R1): "¿qué hizo mi agente?" — dos caras del mismo rastro ──
+// a) Para el AGENTE vía gateway: /agents/internal/audit (X-Agent-User)
+// b) Para el HUMANO en su cuenta: /agents/me/audit (JWT completo, requireAuth)
+// Ambos leen el mismo rastro que YA queda marcado con via:"agent".
+
+async function buildAgentAudit(database, username, limit) {
+  const [notes, nudges, chats] = await Promise.all([
+    database.collection("notes").find(
+      { authorUsername: username, via: "agent" },
+      { projection: { noteId: 1, title: 1, createdAt: 1, visibility: 1 } }
+    ).sort({ createdAt: -1 }).limit(limit).toArray(),
+    database.collection("agent_nudges").find({ username }).sort({ createdAt: -1 }).limit(limit).toArray(),
+    database.collection("messages").find(
+      { senderUsername: username, via: "agent" },
+      { projection: { chatId: 1, content: 1, createdAt: 1 } }
+    ).sort({ createdAt: -1 }).limit(limit).toArray(),
+  ]);
+  return [
+    ...notes.map((n) => ({ kind: "note", noteId: n.noteId, title: n.title, visibility: n.visibility, createdAt: n.createdAt })),
+    ...nudges.map((g) => ({ kind: "nudge", message: (g.message || "").slice(0, 80), createdAt: g.createdAt })),
+    ...chats.map((m) => ({ kind: "chat_message", chatId: m.chatId, preview: (m.content || "").slice(0, 80), createdAt: m.createdAt })),
+  ].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, limit);
+}
+
+app.get("/agents/internal/audit", internalAuth, async (req, res) => {
+  try {
+    const username = agentUser(req);
+    if (!username) return res.status(400).json({ success: false, error: { code: "BAD_AGENT_USER", message: "X-Agent-User inválido.", fix: "Header requerido." } });
+    const limit = Math.min(parseInt(req.query.limit || "30", 10) || 30, 50);
+    const database = await getDb();
+    const events = await buildAgentAudit(database, username, limit);
+    res.json({ success: true, data: events, tip: "Rastro completo del agente. Notas, nudges y mensajes llevan via:'agent' para distinguirlos." });
+  } catch (e) { console.error(e); res.status(500).json({ success: false, error: { code: "INTERNAL", message: "Error interno.", fix: "Reintenta con backoff." } }); }
+});
+
+app.get("/agents/me/audit", auth, requireAuth, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit || "30", 10) || 30, 50);
+    const database = await getDb();
+    const events = await buildAgentAudit(database, req.user.username, limit);
+    res.json({ success: true, events, tip: "Todo lo que tu agente ha hecho con tu cuenta. Cada acción lleva su sello." });
+  } catch (e) { console.error(e); res.status(500).json({ success: false, error: { code: "INTERNAL", message: "Error interno.", fix: "Recarga en unos segundos." } }); }
+});
+
 module.exports = app;
