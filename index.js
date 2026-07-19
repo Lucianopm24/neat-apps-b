@@ -7079,11 +7079,14 @@ app.post("/agents/internal/nudge", internalAuth, async (req, res) => {
     // NTFY_BASE permite apuntar a otro servidor self-hosted sin tocar código.
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(user.ntfyTopic))
       return res.status(500).json({ success: false, error: { code: "BAD_TOPIC", message: "ntfyTopic con formato inesperado.", fix: "Re-genera el topic con /ntfy/setup." } });
+    // ntfy "JSON publish": los headers HTTP planos NO aceptan UTF-8 (undici tira
+    // TypeError con el 🦞). El JSON publish es la vía oficial de ntfy para no-ASCII:
+    // POST al root del servidor con el topic dentro del body JSON (UTF-8 seguro).
     const ntfyBase = (process.env.NTFY_BASE || "https://push.tchncs.de").replace(/\/+$/, "");
-    const nr = await fetch(`${ntfyBase}/${user.ntfyTopic}`, {
+    const nr = await fetch(ntfyBase, {
       method: "POST",
-      headers: { "Title": `🦞 Agente de ${username}`, "Tags": "robot,neat" },
-      body: text,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ topic: user.ntfyTopic, title: `🦞 Agente de ${username}`, tags: ["robot"], message: text }),
     });
     if (!nr.ok) return res.status(502).json({ success: false, error: { code: "NTFY_ERROR", message: "El servidor ntfy respondió error.", fix: "Reintenta en unos segundos." } });
 
