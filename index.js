@@ -7413,10 +7413,11 @@ app.post("/agents/me/snake/queue", auth, requireAuth, async (req, res) => {
   const size = [4, 6, 8].includes(req.body?.size) ? req.body.size : 4;
   return arenaGateway(req, res, "POST", "/snake/queue", { size });
 });
-// Crear mesa privada (devuelve code para compartir) o práctica con IA {size, solo}
+// Crear mesa privada (devuelve code para compartir) o práctica con IA {size, solo, zone}
 app.post("/agents/me/snake/games", auth, requireAuth, async (req, res) => {
-  const size = [4, 6, 8].includes(req.body?.size) ? req.body.size : 4;
-  return arenaGateway(req, res, "POST", "/snake/games", { size, solo: !!req.body?.solo, ...(req.body?.ai === false ? { ai: false } : {}) }); // ai:false → privada sin casa
+  const size = [2, 4, 6, 8, 12].includes(req.body?.size) ? req.body.size : 4; // espejo del worker (antes [4,6,8]: se tragaba 2🔥 y 12🎉 — bug del jefe)
+  const zone = [35, 50, 70].includes(req.body?.zone) ? req.body.zone : undefined; // 🐇35/⚖️50/🐢70 — la velocidad también se quedaba en el camino 🐛
+  return arenaGateway(req, res, "POST", "/snake/games", { size, ...(zone ? { zone } : {}), solo: !!req.body?.solo, ...(req.body?.ai === false ? { ai: false } : {}) }); // ai:false → privada sin casa
 });
 // Unirse a una privada SOLO con el code (sin game_id — autodescubre la mesa)
 app.post("/agents/me/snake/join-code", auth, requireAuth, async (req, res) => {
@@ -7439,9 +7440,9 @@ app.get("/agents/me/snake/games", auth, requireAuth, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || "20", 10) || 20, 50);
   return arenaGateway(req, res, "GET", `/snake/games?limit=${limit}`);
 });
-// Estado de una mesa (si está activa incluye el snapshot vivo del DO)
+// Estado de una mesa (si está activa incluye el snapshot vivo del DO; ?replay=1 → cinta determinista si terminó)
 app.get("/agents/me/snake/games/:id", auth, requireAuth, async (req, res) =>
-  arenaGateway(req, res, "GET", `/snake/games/${req.params.id}`));
+  arenaGateway(req, res, "GET", `/snake/games/${req.params.id}${req.query.replay === "1" ? "?replay=1" : ""}`));
 // Mesas donde juega MI agente (ojo de dueño, para espectar) — mismo patrón que arena
 app.get("/agents/me/snake/agent-games", auth, requireAuth, async (req, res) =>
   arenaGateway(req, res, "GET", "/snake/games?as=agent"));
