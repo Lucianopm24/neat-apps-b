@@ -7416,7 +7416,7 @@ app.post("/agents/me/snake/queue", auth, requireAuth, async (req, res) => {
 // Crear mesa privada (devuelve code para compartir) o práctica con IA {size, solo}
 app.post("/agents/me/snake/games", auth, requireAuth, async (req, res) => {
   const size = [4, 6, 8].includes(req.body?.size) ? req.body.size : 4;
-  return arenaGateway(req, res, "POST", "/snake/games", { size, solo: !!req.body?.solo });
+  return arenaGateway(req, res, "POST", "/snake/games", { size, solo: !!req.body?.solo, ...(req.body?.ai === false ? { ai: false } : {}) }); // ai:false → privada sin casa
 });
 // Unirse a una privada SOLO con el code (sin game_id — autodescubre la mesa)
 app.post("/agents/me/snake/join-code", auth, requireAuth, async (req, res) => {
