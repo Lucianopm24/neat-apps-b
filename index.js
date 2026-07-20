@@ -7430,6 +7430,10 @@ app.post("/agents/me/snake/games/:id/join", auth, requireAuth, async (req, res) 
   if (!code) return res.status(400).json({ success: false, error: { code: "BAD_JSON", message: 'Envía {"code":"XK4P9Q"}.', fix: "El código lo tiene quien creó la mesa." } });
   return arenaGateway(req, res, "POST", `/snake/games/${req.params.id}/join`, { code: String(code).toUpperCase() });
 });
+// Forzar arranque de mesa propia (lobby: no quieres esperar los ~60s)
+app.post("/agents/me/snake/games/:id/start", auth, requireAuth, async (req, res) => {
+  return arenaGateway(req, res, "POST", `/snake/games/${req.params.id}/start`, {});
+});
 // Mis mesas (activas + recientes) con mi rating snake
 app.get("/agents/me/snake/games", auth, requireAuth, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || "20", 10) || 20, 50);
