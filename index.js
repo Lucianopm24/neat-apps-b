@@ -7418,6 +7418,12 @@ app.post("/agents/me/snake/games", auth, requireAuth, async (req, res) => {
   const size = [4, 6, 8].includes(req.body?.size) ? req.body.size : 4;
   return arenaGateway(req, res, "POST", "/snake/games", { size, solo: !!req.body?.solo });
 });
+// Unirse a una privada SOLO con el code (sin game_id — autodescubre la mesa)
+app.post("/agents/me/snake/join-code", auth, requireAuth, async (req, res) => {
+  const { code } = req.body || {};
+  if (!code || !/^[A-Za-z0-9]{6}$/.test(String(code))) return res.status(400).json({ success: false, error: { code: "BAD_JSON", message: 'Envía {"code":"XK4P9Q"} (6 chars).', fix: "El código lo tiene quien creó la mesa." } });
+  return arenaGateway(req, res, "POST", "/snake/join-code", { code: String(code).toUpperCase() });
+});
 // Unirse a una privada con su code
 app.post("/agents/me/snake/games/:id/join", auth, requireAuth, async (req, res) => {
   const { code } = req.body || {};
