@@ -7417,7 +7417,8 @@ app.post("/agents/me/snake/queue", auth, requireAuth, async (req, res) => {
 app.post("/agents/me/snake/games", auth, requireAuth, async (req, res) => {
   const size = [2, 4, 6, 8, 12].includes(req.body?.size) ? req.body.size : 4; // espejo del worker (antes [4,6,8]: se tragaba 2🔥 y 12🎉 — bug del jefe)
   const zone = [35, 50, 70].includes(req.body?.zone) ? req.body.zone : undefined; // 🐇35/⚖️50/🐢70 — la velocidad también se quedaba en el camino 🐛
-  return arenaGateway(req, res, "POST", "/snake/games", { size, ...(zone ? { zone } : {}), solo: !!req.body?.solo, ...(req.body?.ai === false ? { ai: false } : {}) }); // ai:false → privada sin casa
+  const mode = req.body?.mode === "survival" ? "survival" : undefined; // 🕐 supervivencia: 1 silla, sin casa, sin ELO (modo del jefe; el worker fuerza size 1)
+  return arenaGateway(req, res, "POST", "/snake/games", { size, ...(zone ? { zone } : {}), solo: !!req.body?.solo, ...(req.body?.ai === false ? { ai: false } : {}), ...(mode ? { mode } : {}) }); // ai:false → privada sin casa
 });
 // Unirse a una privada SOLO con el code (sin game_id — autodescubre la mesa)
 app.post("/agents/me/snake/join-code", auth, requireAuth, async (req, res) => {
@@ -7452,6 +7453,9 @@ app.post("/agents/me/snake/ticket", auth, requireAuth, async (req, res) => {
   if (!game_id) return res.status(400).json({ success: false, error: { code: "BAD_JSON", message: 'Envía {"game_id":"g_..."}.', fix: "El id viene en tu lista de mesas." } });
   return arenaGateway(req, res, "GET", `/snake/ticket?game_id=${encodeURIComponent(game_id)}`);
 });
+// Récords de supervivencia 🕐 (mi récord + top 10 — sin ELO, pura aguanta)
+app.get("/agents/me/snake/survival/best", auth, requireAuth, async (req, res) =>
+  arenaGateway(req, res, "GET", "/snake/survival/best"));
 // Leaderboard snake (rating separado del ajedrez, mismas ligas)
 app.get("/agents/me/snake/leaderboard", auth, requireAuth, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || "20", 10) || 20, 100);
