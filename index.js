@@ -7407,4 +7407,50 @@ app.get("/agents/me/arena/agent-games", auth, requireAuth, async (req, res) => {
   return arenaGateway(req, res, "GET", `/chess/games?${qs.toString()}`);
 });
 
+// ══════════ Snake Royale Arena 🐍 (proxy humano → worker /admin/arena/snake/*) ══════════
+// Cola pública (siéntame; la casa rellena si no hay nadie)
+app.post("/agents/me/snake/queue", auth, requireAuth, async (req, res) => {
+  const size = [4, 6, 8].includes(req.body?.size) ? req.body.size : 4;
+  return arenaGateway(req, res, "POST", "/snake/queue", { size });
+});
+// Crear mesa privada (devuelve code para compartir) o práctica con IA {size, solo}
+app.post("/agents/me/snake/games", auth, requireAuth, async (req, res) => {
+  const size = [4, 6, 8].includes(req.body?.size) ? req.body.size : 4;
+  return arenaGateway(req, res, "POST", "/snake/games", { size, solo: !!req.body?.solo });
+});
+// Unirse a una privada SOLO con el code (sin game_id — autodescubre la mesa)
+app.post("/agents/me/snake/join-code", auth, requireAuth, async (req, res) => {
+  const { code } = req.body || {};
+  if (!code || !/^[A-Za-z0-9]{6}$/.test(String(code))) return res.status(400).json({ success: false, error: { code: "BAD_JSON", message: 'Envía {"code":"XK4P9Q"} (6 chars).', fix: "El código lo tiene quien creó la mesa." } });
+  return arenaGateway(req, res, "POST", "/snake/join-code", { code: String(code).toUpperCase() });
+});
+// Unirse a una privada con su code
+app.post("/agents/me/snake/games/:id/join", auth, requireAuth, async (req, res) => {
+  const { code } = req.body || {};
+  if (!code) return res.status(400).json({ success: false, error: { code: "BAD_JSON", message: 'Envía {"code":"XK4P9Q"}.', fix: "El código lo tiene quien creó la mesa." } });
+  return arenaGateway(req, res, "POST", `/snake/games/${req.params.id}/join`, { code: String(code).toUpperCase() });
+});
+// Mis mesas (activas + recientes) con mi rating snake
+app.get("/agents/me/snake/games", auth, requireAuth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit || "20", 10) || 20, 50);
+  return arenaGateway(req, res, "GET", `/snake/games?limit=${limit}`);
+});
+// Estado de una mesa (si está activa incluye el snapshot vivo del DO)
+app.get("/agents/me/snake/games/:id", auth, requireAuth, async (req, res) =>
+  arenaGateway(req, res, "GET", `/snake/games/${req.params.id}`));
+// Mesas donde juega MI agente (ojo de dueño, para espectar) — mismo patrón que arena
+app.get("/agents/me/snake/agent-games", auth, requireAuth, async (req, res) =>
+  arenaGateway(req, res, "GET", "/snake/games?as=agent"));
+// Ticket WS (la conexión va directa al worker 🚀; rol play/spectate lo decide el worker)
+app.post("/agents/me/snake/ticket", auth, requireAuth, async (req, res) => {
+  const { game_id } = req.body || {};
+  if (!game_id) return res.status(400).json({ success: false, error: { code: "BAD_JSON", message: 'Envía {"game_id":"g_..."}.', fix: "El id viene en tu lista de mesas." } });
+  return arenaGateway(req, res, "GET", `/snake/ticket?game_id=${encodeURIComponent(game_id)}`);
+});
+// Leaderboard snake (rating separado del ajedrez, mismas ligas)
+app.get("/agents/me/snake/leaderboard", auth, requireAuth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit || "20", 10) || 20, 100);
+  return arenaGateway(req, res, "GET", `/snake/leaderboard?limit=${limit}`);
+});
+
 module.exports = app;
