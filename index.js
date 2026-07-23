@@ -16,7 +16,11 @@ const ADMIN_USER = process.env.ADMIN_USER || "luciano";
 const ADMIN_PASS = process.env.ADMIN_PASS || "changeme";
 const MONGO_URI = process.env.MONGODB_URI;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const EMAIL_DOMAIN = "neat.blue";
+const EMAIL_DOMAIN = "neat.qzz.io";        // buzón automático de usuarios (Neat Mail, mail.neat.blue)
+const ADMIN_EMAIL_DOMAIN = "neat.blue";     // correo de la casa — no se migra (forwards propios)
+const HOUSE_EMAIL_DOMAINS = [EMAIL_DOMAIN, ADMIN_EMAIL_DOMAIN];
+// correos emitidos por la casa (sintéticos por username): la verificación es vía login Neat, nunca por envío
+const isHouseEmail = (e = "") => { e = String(e).toLowerCase(); return HOUSE_EMAIL_DOMAINS.some((d) => e.endsWith("@" + d)); };
 const GMAIL_USER = process.env.GMAIL_USER || null;   // ej. neatappsmail@gmail.com
 const GMAIL_PASS = process.env.GMAIL_PASS || null;   // contraseña de aplicación de Google
 const NEAT_ID_BASE = process.env.NEAT_ID_BASE || "https://id.neat.qzz.io"; // base pública del servidor
@@ -116,7 +120,7 @@ app.post("/auth/login", (req, res) => {
   if (username !== ADMIN_USER || password !== ADMIN_PASS)
     return res.status(401).json({ error: "Invalid credentials" });
   const token = jwt.sign({ username, role: "admin" }, SECRET, { expiresIn: "30d" });
-  res.json({ token, role: "admin", username, email: `${username}@${EMAIL_DOMAIN}` });
+  res.json({ token, role: "admin", username, email: `${username}@${ADMIN_EMAIL_DOMAIN}` });
 });
 
 // ── Auth usuarios normales ─────────────────────────────────────────────────────
@@ -394,7 +398,7 @@ app.get("/chat/users/list", auth, requireScope("chatter"), async (req, res) => {
     const users = await database.collection("users")
       .find({}, { projection: { passwordHash: 0 } })
       .toArray();
-    const adminUser = { _id: "admin", username: ADMIN_USER, email: `${ADMIN_USER}@${EMAIL_DOMAIN}`, role: "admin" };
+    const adminUser = { _id: "admin", username: ADMIN_USER, email: `${ADMIN_USER}@${ADMIN_EMAIL_DOMAIN}`, role: "admin" };
     res.json([adminUser, ...users]);
   } catch { res.status(500).json({ error: "Error interno" }); }
 });
@@ -454,7 +458,7 @@ app.post("/chat/login", async (req, res) => {
     // Si es admin, usar flujo admin
     if (username === ADMIN_USER && password === ADMIN_PASS) {
       const token = jwt.sign({ username, role: "admin" }, SECRET, { expiresIn: "30d" });
-      return res.json({ token, role: "admin", username, email: `${username}@${EMAIL_DOMAIN}` });
+      return res.json({ token, role: "admin", username, email: `${username}@${ADMIN_EMAIL_DOMAIN}` });
     }
 
     const database = await getDb();
@@ -491,7 +495,7 @@ app.get("/chat/me", auth, requireScope("chatter"), async (req, res) => {
   if (req.user.role === "admin") {
     return res.json({
       username: req.user.username,
-      email: `${req.user.username}@${EMAIL_DOMAIN}`,
+      email: `${req.user.username}@${req.user.role === "admin" ? ADMIN_EMAIL_DOMAIN : EMAIL_DOMAIN}`,
       role: "admin",
     });
   }
@@ -514,7 +518,7 @@ app.get("/chat/users", adminAuth, async (req, res) => {
   const adminUser = {
     _id: "admin",
     username: ADMIN_USER,
-    email: `${ADMIN_USER}@${EMAIL_DOMAIN}`,
+    email: `${ADMIN_USER}@${ADMIN_EMAIL_DOMAIN}`,
     role: "admin",
     createdAt: null,
   };
@@ -1475,7 +1479,7 @@ app.get("/u/:username", async (req, res) => {
     if (isAdmin) {
       profile = {
         username: ADMIN_USER,
-        email: `${ADMIN_USER}@${EMAIL_DOMAIN}`,
+        email: `${ADMIN_USER}@${ADMIN_EMAIL_DOMAIN}`,
         role: "admin",
         verified: true,
         bio: "¡Hola! Soy el Creador de las apps de Neat. Si deseas contactarme, hazlo por Chatter.",
@@ -1890,7 +1894,7 @@ app.get("/oauth/userinfo", auth, requireScope("profile"), async (req, res) => {
       return res.json({
         sub: req.user.username,
         username: req.user.username,
-        email: `${req.user.username}@${EMAIL_DOMAIN}`,
+        email: `${req.user.username}@${req.user.role === "admin" ? ADMIN_EMAIL_DOMAIN : EMAIL_DOMAIN}`,
         verified: true,
         role: "admin",
         neatPlus: true
@@ -1956,7 +1960,7 @@ app.get("/oauth/kv", auth, requireScope("kv"), async (req, res) => {
       }
     }
     if (hasScope("email")) {
-      result.email = isAdmin ? `${username}@${EMAIL_DOMAIN}` :
+      result.email = isAdmin ? `${username}@${ADMIN_EMAIL_DOMAIN}` :
         (await database.collection("users").findOne({ username }))?.email || null;
     }
 
@@ -3831,7 +3835,7 @@ app.post("/id/users/:slug/resend-verification", async (req, res) => {
       email: email.toLowerCase()
     });
     // Respuesta genérica para no revelar si el email existe
-    if (!user || user.emailVerified || user.email.endsWith("@neat.blue"))
+    if (!user || user.emailVerified || isHouseEmail(user.email))
       return res.json({ ok: true });
 
     const newToken = crypto.randomBytes(32).toString("hex");
@@ -4128,9 +4132,9 @@ app.post("/id/users/:slug/register", async (req, res) => {
     const passwordHash = await bcrypt.hash(password, 10);
 
     // Determinar estado de verificación inicial según tipo de email
-    // - @neat.blue → se verifica al hacer login con Neat, no por correo
+    // - correo de la casa (@neat.qzz.io / @neat.blue) → se verifica al hacer login con Neat, no por envío
     // - otro dominio → si el tenant requiere verificación, emitir token y mandar correo
-    const isNeatEmail = email.toLowerCase().endsWith("@neat.blue");
+    const isNeatEmail = isHouseEmail(email);
     let emailVerified = isNeatEmail ? false : true; // emails externos se marcan verificados por defecto salvo que el tenant exija verificación
     let emailVerifToken = null;
     let emailVerifExpiresAt = null;
@@ -4272,7 +4276,7 @@ app.post("/id/users/:slug/login", async (req, res) => {
 
     // Bloquear si el tenant requiere verificación y el usuario aún no verificó
     if (app.requireEmailVerification && !user.emailVerified) {
-      const isNeatEmail = user.email.endsWith("@neat.blue");
+      const isNeatEmail = isHouseEmail(user.email);
       return res.status(403).json({
         error: "Email no verificado",
         requiresVerification: true,
@@ -4400,11 +4404,11 @@ app.get("/id/callback", async (req, res) => {
       neatUserId: neatUser.sub
     });
 
-    // También buscar usuario local que tenga email @neat.blue coincidente con este neatUsername
+    // También buscar usuario local cuyo email de la casa (@neat.qzz.io / legacy @neat.blue) coincida con este neatUsername
     // (se registró con ese email antes de vincular su cuenta Neat)
     const neatEmailMatch = await database.collection("id_app_users").findOne({
       appSlug,
-      email: `${neatUser.username}@neat.blue`,
+      email: { $in: HOUSE_EMAIL_DOMAINS.map((d) => `${neatUser.username}@${d}`) },
       neatUserId: null  // no vinculado aún
     });
 
@@ -4422,8 +4426,8 @@ app.get("/id/callback", async (req, res) => {
       const syncFields = existingUser.passwordHash
         ? { lastNeatSync: new Date() }
         : { email: neatUser.email || existingUser.email, username: neatUser.username, lastNeatSync: new Date() };
-      // Si este usuario tenía email @neat.blue sin verificar, lo marcamos verificado ahora
-      if (!existingUser.emailVerified && existingUser.email.endsWith("@neat.blue")) {
+      // Si este usuario tenía email de la casa sin verificar, lo marcamos verificado ahora
+      if (!existingUser.emailVerified && isHouseEmail(existingUser.email)) {
         syncFields.emailVerified = true;
         syncFields.emailVerifToken = null;
         syncFields.emailVerifExpiresAt = null;
@@ -4458,7 +4462,7 @@ app.get("/id/callback", async (req, res) => {
       }
       const result = await database.collection("id_app_users").insertOne({
         appSlug,
-        email: neatUser.email || `${neatUser.username}@neat.blue`,
+        email: neatUser.email || `${neatUser.username}@${EMAIL_DOMAIN}`,
         username: neatUser.username,
         passwordHash: null,       // no tiene password local, entra solo con Neat
         neatUserId: neatUser.sub, // vinculado
@@ -4797,11 +4801,11 @@ app.post("/id/users/:slug/manage/login-with-neat", async (req, res) => {
       neatUserId: neatUser.sub
     });
 
-    // Si no hay usuario vinculado, buscar por email @neat.blue coincidente
+    // Si no hay usuario vinculado, buscar por email de la casa coincidente (ambas variantes)
     if (!user) {
       const neatEmailMatch = await database.collection("id_app_users").findOne({
         appSlug: req.params.slug,
-        email: `${neatUser.username}@neat.blue`,
+        email: { $in: HOUSE_EMAIL_DOMAINS.map((d) => `${neatUser.username}@${d}`) },
         neatUserId: null
       });
       if (neatEmailMatch) {
@@ -4818,8 +4822,8 @@ app.post("/id/users/:slug/manage/login-with-neat", async (req, res) => {
       return res.status(404).json({ error: "No hay cuenta vinculada a este Neat en esta app. Inicia sesión primero con 'Continuar con Neat' desde el login normal." });
     if (user.suspended) return res.status(403).json({ error: "Cuenta suspendida en esta app" });
 
-    // Marcar emailVerified si es @neat.blue y no estaba verificado
-    if (!user.emailVerified && user.email.endsWith("@neat.blue")) {
+    // Marcar emailVerified si es correo de la casa y no estaba verificado
+    if (!user.emailVerified && isHouseEmail(user.email)) {
       await database.collection("id_app_users").updateOne(
         { _id: user._id },
         { $set: { emailVerified: true, emailVerifToken: null, emailVerifExpiresAt: null } }
@@ -5745,9 +5749,9 @@ app.post("/id/users/:slug/forgot-password", async (req, res) => {
     // Siempre respondemos ok para no revelar si el email existe
     if (!user || !user.passwordHash) return res.json({ ok: true });
 
-    // @neat.blue no puede recibir correos — no enviamos nada,
+    // los emails de la casa se verifican entrando con Neat — aquí no enviamos nada,
     // el frontend ya les habrá dicho que entren con Neat
-    if (user.email.endsWith("@neat.blue")) return res.json({ ok: true });
+    if (isHouseEmail(user.email)) return res.json({ ok: true });
 
     const resetToken = crypto.randomBytes(32).toString("hex");
     const resetExpiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1h
