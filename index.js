@@ -16,7 +16,7 @@ const ADMIN_USER = process.env.ADMIN_USER || "luciano";
 const ADMIN_PASS = process.env.ADMIN_PASS || "changeme";
 const MONGO_URI = process.env.MONGODB_URI;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const EMAIL_DOMAIN = "neat.qzz.io";
+const EMAIL_DOMAIN = "neat.blue";
 const GMAIL_USER = process.env.GMAIL_USER || null;   // ej. neatappsmail@gmail.com
 const GMAIL_PASS = process.env.GMAIL_PASS || null;   // contraseña de aplicación de Google
 const NEAT_ID_BASE = process.env.NEAT_ID_BASE || "https://id.neat.qzz.io"; // base pública del servidor
@@ -233,7 +233,7 @@ async function notifyParticipants(database, chatId, message, senderIdentifier) {
       { projection: { ntfyTopic: 1, neatPlus: 1 } }
     );
     if (!recipientUser?.ntfyTopic || !recipientUser?.neatPlus) continue;
-    const chatUrl = `https://neat.qzz.io/byneat/chatter?chat=${chatId}`;
+    const chatUrl = `https://neat.blue/byneat/chatter?chat=${chatId}`;
     fetch(`https://push.tchncs.de/${recipientUser.ntfyTopic}`, {
       method: "POST",
       headers: {
@@ -1493,10 +1493,10 @@ app.get("/u/:username", async (req, res) => {
 
     // Links automáticos — siempre presentes
     const autoLinks = [
-      { label: "Neat Chatter", url: `https://neat.qzz.io/byneat/chatter`, icon: "💬", auto: true },
-      { label: "Neat Watch", url: `https://neat.qzz.io/byneat/watch`, icon: "▶️", auto: true },
-      { label: "Neat Forums", url: `https://neat.qzz.io/byneat/forums`, icon: "🗣️", auto: true },
-      { label: "Neat Points", url: `https://neat.qzz.io/byneat/points`, icon: "💰", auto: true },
+      { label: "Neat Chatter", url: `https://neat.blue/byneat/chatter`, icon: "💬", auto: true },
+      { label: "Neat Watch", url: `https://neat.blue/byneat/watch`, icon: "▶️", auto: true },
+      { label: "Neat Forums", url: `https://neat.blue/byneat/forums`, icon: "🗣️", auto: true },
+      { label: "Neat Points", url: `https://neat.blue/byneat/points`, icon: "💰", auto: true },
     ];
 
   let profileViews = undefined;
@@ -2071,7 +2071,7 @@ app.get("/.well-known/openid-configuration", (req, res) => {
   const base = "https://neat-apps-b.vercel.app";
   res.json({
     issuer: base,
-    authorization_endpoint: "https://neat.qzz.io/oauth.html",
+    authorization_endpoint: "https://neat.blue/oauth.html",
     token_endpoint: `${base}/oauth/token`,
     userinfo_endpoint: `${base}/oauth/userinfo`,
     jwks_uri: `${base}/.well-known/jwks.json`,
@@ -3620,7 +3620,7 @@ app.post("/id/apps", auth, requireAuth, async (req, res) => {
     // Client interno — PKCE, público, usado por id.neat.qzz.io/ (raíz)
     // redirect_uri interna fija: el propio servidor de Neat redirige el code al tenant
     const internalClient = {
-      name,  // se muestra en la pantalla de aprobación de neat.qzz.io/oauth.html
+      name,  // se muestra en la pantalla de aprobación de neat.blue/oauth.html
       clientId: generateClientId(),
       clientSecret: null,  // PKCE público, no tiene secret
       redirectUris: [
@@ -3831,7 +3831,7 @@ app.post("/id/users/:slug/resend-verification", async (req, res) => {
       email: email.toLowerCase()
     });
     // Respuesta genérica para no revelar si el email existe
-    if (!user || user.emailVerified || user.email.endsWith("@neat.qzz.io"))
+    if (!user || user.emailVerified || user.email.endsWith("@neat.blue"))
       return res.json({ ok: true });
 
     const newToken = crypto.randomBytes(32).toString("hex");
@@ -4128,9 +4128,9 @@ app.post("/id/users/:slug/register", async (req, res) => {
     const passwordHash = await bcrypt.hash(password, 10);
 
     // Determinar estado de verificación inicial según tipo de email
-    // - @neat.qzz.io → se verifica al hacer login con Neat, no por correo
+    // - @neat.blue → se verifica al hacer login con Neat, no por correo
     // - otro dominio → si el tenant requiere verificación, emitir token y mandar correo
-    const isNeatEmail = email.toLowerCase().endsWith("@neat.qzz.io");
+    const isNeatEmail = email.toLowerCase().endsWith("@neat.blue");
     let emailVerified = isNeatEmail ? false : true; // emails externos se marcan verificados por defecto salvo que el tenant exija verificación
     let emailVerifToken = null;
     let emailVerifExpiresAt = null;
@@ -4272,7 +4272,7 @@ app.post("/id/users/:slug/login", async (req, res) => {
 
     // Bloquear si el tenant requiere verificación y el usuario aún no verificó
     if (app.requireEmailVerification && !user.emailVerified) {
-      const isNeatEmail = user.email.endsWith("@neat.qzz.io");
+      const isNeatEmail = user.email.endsWith("@neat.blue");
       return res.status(403).json({
         error: "Email no verificado",
         requiresVerification: true,
@@ -4400,11 +4400,11 @@ app.get("/id/callback", async (req, res) => {
       neatUserId: neatUser.sub
     });
 
-    // También buscar usuario local que tenga email @neat.qzz.io coincidente con este neatUsername
+    // También buscar usuario local que tenga email @neat.blue coincidente con este neatUsername
     // (se registró con ese email antes de vincular su cuenta Neat)
     const neatEmailMatch = await database.collection("id_app_users").findOne({
       appSlug,
-      email: `${neatUser.username}@neat.qzz.io`,
+      email: `${neatUser.username}@neat.blue`,
       neatUserId: null  // no vinculado aún
     });
 
@@ -4422,8 +4422,8 @@ app.get("/id/callback", async (req, res) => {
       const syncFields = existingUser.passwordHash
         ? { lastNeatSync: new Date() }
         : { email: neatUser.email || existingUser.email, username: neatUser.username, lastNeatSync: new Date() };
-      // Si este usuario tenía email @neat.qzz.io sin verificar, lo marcamos verificado ahora
-      if (!existingUser.emailVerified && existingUser.email.endsWith("@neat.qzz.io")) {
+      // Si este usuario tenía email @neat.blue sin verificar, lo marcamos verificado ahora
+      if (!existingUser.emailVerified && existingUser.email.endsWith("@neat.blue")) {
         syncFields.emailVerified = true;
         syncFields.emailVerifToken = null;
         syncFields.emailVerifExpiresAt = null;
@@ -4433,7 +4433,7 @@ app.get("/id/callback", async (req, res) => {
         { $set: syncFields }
       );
     } else if (neatEmailMatch) {
-      // Usuario que se registró con su @neat.qzz.io antes de vincular Neat:
+      // Usuario que se registró con su @neat.blue antes de vincular Neat:
       // vinculamos su cuenta y la marcamos verificada
       if (neatEmailMatch.suspended)
         return res.redirect(`${redirectUri}?error=access_denied&error_description=${encodeURIComponent("Tu cuenta de esta app está suspendida.")}`);
@@ -4458,7 +4458,7 @@ app.get("/id/callback", async (req, res) => {
       }
       const result = await database.collection("id_app_users").insertOne({
         appSlug,
-        email: neatUser.email || `${neatUser.username}@neat.qzz.io`,
+        email: neatUser.email || `${neatUser.username}@neat.blue`,
         username: neatUser.username,
         passwordHash: null,       // no tiene password local, entra solo con Neat
         neatUserId: neatUser.sub, // vinculado
@@ -4471,7 +4471,7 @@ app.get("/id/callback", async (req, res) => {
     }
 
     // Si el tenant requiere verificación, verificar que el usuario ya está verificado
-    // (puede ocurrir si existingUser aún no verificó y su email no es @neat.qzz.io)
+    // (puede ocurrir si existingUser aún no verificó y su email no es @neat.blue)
     const finalUser = await database.collection("id_app_users").findOne({ _id: new ObjectId(appUserId) });
     if (app.requireEmailVerification && !finalUser.emailVerified) {
       return res.redirect(`${redirectUri}?error=access_denied&error_description=${encodeURIComponent("Debes verificar tu correo electrónico antes de iniciar sesión.")}`);
@@ -4797,11 +4797,11 @@ app.post("/id/users/:slug/manage/login-with-neat", async (req, res) => {
       neatUserId: neatUser.sub
     });
 
-    // Si no hay usuario vinculado, buscar por email @neat.qzz.io coincidente
+    // Si no hay usuario vinculado, buscar por email @neat.blue coincidente
     if (!user) {
       const neatEmailMatch = await database.collection("id_app_users").findOne({
         appSlug: req.params.slug,
-        email: `${neatUser.username}@neat.qzz.io`,
+        email: `${neatUser.username}@neat.blue`,
         neatUserId: null
       });
       if (neatEmailMatch) {
@@ -4818,8 +4818,8 @@ app.post("/id/users/:slug/manage/login-with-neat", async (req, res) => {
       return res.status(404).json({ error: "No hay cuenta vinculada a este Neat en esta app. Inicia sesión primero con 'Continuar con Neat' desde el login normal." });
     if (user.suspended) return res.status(403).json({ error: "Cuenta suspendida en esta app" });
 
-    // Marcar emailVerified si es @neat.qzz.io y no estaba verificado
-    if (!user.emailVerified && user.email.endsWith("@neat.qzz.io")) {
+    // Marcar emailVerified si es @neat.blue y no estaba verificado
+    if (!user.emailVerified && user.email.endsWith("@neat.blue")) {
       await database.collection("id_app_users").updateOne(
         { _id: user._id },
         { $set: { emailVerified: true, emailVerifToken: null, emailVerifExpiresAt: null } }
@@ -4937,7 +4937,7 @@ app.delete("/id/users/:slug/manage/sessions/:sessionId", manageSessionAuth, asyn
 // POST /id/users/:slug/link-neat
 // Un usuario que entró con email+pass local puede vincular su cuenta Neat.
 // Después podrá entrar con ambos métodos.
-// El dev redirige al usuario a neat.qzz.io/oauth con el scope "openid profile email"
+// El dev redirige al usuario a neat.blue/oauth con el scope "openid profile email"
 // usando el internalClientId, y cuando vuelve llama este endpoint.
 app.post("/id/users/:slug/link-neat", async (req, res) => {
   try {
@@ -5723,7 +5723,7 @@ app.delete("/apps/:id", adminAuth, async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════════
 // RECUPERACIÓN DE CONTRASEÑA
 // Dos caminos:
-//   - email @neat.qzz.io → se les dice que entren con Neat desde /manage
+//   - email @neat.blue → se les dice que entren con Neat desde /manage
 //   - otro email → token de 1h enviado por correo, formulario para nueva pass
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -5745,9 +5745,9 @@ app.post("/id/users/:slug/forgot-password", async (req, res) => {
     // Siempre respondemos ok para no revelar si el email existe
     if (!user || !user.passwordHash) return res.json({ ok: true });
 
-    // @neat.qzz.io no puede recibir correos — no enviamos nada,
+    // @neat.blue no puede recibir correos — no enviamos nada,
     // el frontend ya les habrá dicho que entren con Neat
-    if (user.email.endsWith("@neat.qzz.io")) return res.json({ ok: true });
+    if (user.email.endsWith("@neat.blue")) return res.json({ ok: true });
 
     const resetToken = crypto.randomBytes(32).toString("hex");
     const resetExpiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1h
@@ -6918,15 +6918,15 @@ app.get("/", (req, res) => res.json({ status: "ok", service: "neat-api", version
 
 
 // ═══════════════════════════════════════════════════════════════════
-// AGENTES — gateway agents.neat.qzz.io (v0)
+// AGENTES — gateway agents.neat.blue (v0)
 // INSTRUCCIONES: pegar este bloque en neat-apps-b/index.js (al final,
 // antes de app.listen). Es 100% ADITIVO: no toca nada existente.
 // Variables de entorno requeridas en Vercel:
 //   NEAT_INTERNAL_SECRET  (secreto compartido Worker↔Vercel)
-//   AGENTS_WORKER_URL     (default https://agents.neat.qzz.io)
+//   AGENTS_WORKER_URL     (default https://agents.neat.blue)
 // ═══════════════════════════════════════════════════════════════════
 
-const AGENTS_WORKER_URL = process.env.AGENTS_WORKER_URL || "https://agents.neat.qzz.io";
+const AGENTS_WORKER_URL = process.env.AGENTS_WORKER_URL || "https://agents.neat.blue";
 
 // Solo llamadas del Worker con el secreto interno. FAIL-CLOSED: si el
 // secreto no está configurado en Vercel, NIEGA TODO (no modo abierto).
@@ -7082,7 +7082,7 @@ app.delete("/agents/internal/notes/:id", internalAuth, async (req, res) => {
 });
 
 
-// ── Nudge: el agente notifica a su humano (agents.neat.qzz.io v0.2) ──
+// ── Nudge: el agente notifica a su humano (agents.neat.blue v0.2) ──
 app.post("/agents/internal/nudge", internalAuth, async (req, res) => {
   try {
     const username = agentUser(req);
