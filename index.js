@@ -7466,4 +7466,213 @@ app.get("/agents/me/snake/leaderboard", auth, requireAuth, async (req, res) => {
   return arenaGateway(req, res, "GET", `/snake/leaderboard?limit=${limit}`);
 });
 
+// ══════════ Retiros de donaciones vía FaucetPay (USDT) ══════════
+// Agregar junto a las otras constantes de entorno, cerca de MONGO_URI etc.
+const FAUCETPAY_API_KEY = process.env.FAUCETPAY_API_KEY;
+const FAUCETPAY_MIN_WITHDRAW = 0.0001; // USDT — mínimo real de FaucetPay
+
+// FaucetPay normaliza TODAS las monedas a 8 decimales (como satoshis de BTC),
+// sin importar los decimales nativos de la moneda en su blockchain.
+// 1 USDT (FaucetPay) = 100_000_000 unidades mínimas.
+const FAUCETPAY_UNIT_MULTIPLIER = 100_000_000;
+
+function usdtToFaucetPayUnits(amountUsdt) {
+  // Redondeo hacia abajo: nunca enviar de más por error de punto flotante.
+  return Math.floor(amountUsdt * FAUCETPAY_UNIT_MULTIPLIER);
+}
+
+// Helper: obtiene el saldo donado disponible para retirar de un usuario.
+// Ajusta el nombre del campo/colección a como ya guardas el saldo donado.
+async function getDonatedBalance(db, username) {
+  const user = await db.collection("users").findOne({ username });
+  return user?.donatedBalance || 0; // en USDT, no en unidades FaucetPay
+}
+
+// POST /donations/withdraw
+// Body: { amount: number (USDT) }
+// Requiere que el usuario tenga faucetpayEmail guardado en su perfil.
+app.post("/donations/withdraw", auth, requireAuth, async (req, res) => {
+  try {
+    if (!FAUCETPAY_API_KEY) {
+      return res.status(500).json({ error: "FaucetPay no está configurado en el servidor" });
+    }
+
+    const { amount } = req.body || {};
+    const username = req.user.username;
+
+    // ── Validación de input ──────────────────────────────────────────
+    if (typeof amount !== "number" || !isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: "Monto inválido" });
+    }
+    if (amount < FAUCETPAY_MIN_WITHDRAW) {
+      return res.status(400).json({ error: `El mínimo de retiro es ${FAUCETPAY_MIN_WITHDRAW} USDT` });
+    }
+
+    const db = await getDb();
+    const user = await db.collection("users").findOne({ username });
+    if (!user) return res.status(404).json({ error: "Usuario no encontrado" });
+
+    if (!user.faucetpayEmail) {
+      return res.status(400).json({
+        error: "Debes registrar tu email de FaucetPay antes de retirar",
+        fix: "POST /donations/faucetpay-email con { email }",
+      });
+    }
+
+    // ── Verificar saldo donado disponible (no el ganado por captchas) ──
+    const available = user.donatedBalance || 0;
+    if (amount > available) {
+      return res.status(400).json({ error: "Saldo donado insuficiente", available });
+    }
+
+    // ── Verificar que el destino sea un usuario válido de FaucetPay ────
+    const checkResp = await fetch("https://faucetpay.io/api/v1/checkaddress", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        api_key: FAUCETPAY_API_KEY,
+        address: user.faucetpayEmail,
+        currency: "USDT",
+      }),
+    });
+    const checkJson = await checkResp.json().catch(() => null);
+    if (!checkJson || checkJson.status !== 200) {
+      return res.status(400).json({
+        error: "El email de FaucetPay no es válido o no está registrado",
+        detail: checkJson?.message || null,
+      });
+    }
+
+    // ── Descontar saldo ANTES de llamar a FaucetPay (evita doble retiro
+    //    si el usuario dispara dos requests casi simultáneas) ──────────
+    const decremented = await db.collection("users").findOneAndUpdate(
+      { username, donatedBalance: { $gte: amount } },
+      { $inc: { donatedBalance: -amount } },
+      { returnDocument: "after" }
+    );
+    if (!decremented?.value && !decremented) {
+      // saldo cambió entre el check y este punto (carrera de concurrencia)
+      return res.status(409).json({ error: "Saldo insuficiente (concurrencia), reintenta" });
+    }
+
+    // ── Registrar la transacción como "pending" antes del envío ────────
+    const withdrawalDoc = {
+      username,
+      amountUsdt: amount,
+      faucetpayEmail: user.faucetpayEmail,
+      status: "pending",
+      createdAt: new Date(),
+    };
+    const { insertedId } = await db.collection("donation_withdrawals").insertOne(withdrawalDoc);
+
+    // ── Llamada real a FaucetPay ────────────────────────────────────────
+    const units = usdtToFaucetPayUnits(amount);
+    const ip =
+      req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
+      req.socket?.remoteAddress ||
+      "0.0.0.0";
+
+    let sendJson;
+    try {
+      const sendResp = await fetch("https://faucetpay.io/api/v1/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          api_key: FAUCETPAY_API_KEY,
+          amount: String(units),
+          to: user.faucetpayEmail,
+          currency: "USDT",
+          ip_address: ip,
+        }),
+      });
+      sendJson = await sendResp.json().catch(() => null);
+    } catch (e) {
+      console.error("[faucetpay send] error de red:", e.message);
+      sendJson = null;
+    }
+
+    // ── Si FaucetPay falló, revertir el saldo y marcar como fallido ─────
+    if (!sendJson || sendJson.status !== 200) {
+      await db.collection("users").updateOne(
+        { username },
+        { $inc: { donatedBalance: amount } } // devolver el saldo
+      );
+      await db.collection("donation_withdrawals").updateOne(
+        { _id: insertedId },
+        { $set: { status: "failed", error: sendJson?.message || "Sin respuesta de FaucetPay", failedAt: new Date() } }
+      );
+      return res.status(502).json({
+        error: "El retiro falló, tu saldo fue devuelto",
+        detail: sendJson?.message || null,
+      });
+    }
+
+    // ── Éxito: guardar payout_id para auditoría ─────────────────────────
+    await db.collection("donation_withdrawals").updateOne(
+      { _id: insertedId },
+      {
+        $set: {
+          status: "completed",
+          payoutId: sendJson.payout_id,
+          payoutUserHash: sendJson.payout_user_hash,
+          completedAt: new Date(),
+        },
+      }
+    );
+
+    return res.json({
+      ok: true,
+      amountUsdt: amount,
+      payoutId: sendJson.payout_id,
+      newBalance: (decremented.value || decremented).donatedBalance,
+    });
+  } catch (err) {
+    console.error("[donations withdraw]", err.message);
+    return res.status(500).json({ error: "Error interno al procesar el retiro" });
+  }
+});
+
+// POST /donations/faucetpay-email
+// Body: { email: string }
+// Guarda/actualiza el email de FaucetPay del usuario (previa verificación).
+app.post("/donations/faucetpay-email", auth, requireAuth, async (req, res) => {
+  try {
+    if (!FAUCETPAY_API_KEY) {
+      return res.status(500).json({ error: "FaucetPay no está configurado en el servidor" });
+    }
+    const { email } = req.body || {};
+    if (typeof email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: "Email inválido" });
+    }
+
+    const checkResp = await fetch("https://faucetpay.io/api/v1/checkaddress", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        api_key: FAUCETPAY_API_KEY,
+        address: email,
+        currency: "USDT",
+      }),
+    });
+    const checkJson = await checkResp.json().catch(() => null);
+    if (!checkJson || checkJson.status !== 200) {
+      return res.status(400).json({
+        error: "Ese email no pertenece a una cuenta de FaucetPay registrada",
+        detail: checkJson?.message || null,
+      });
+    }
+
+    const db = await getDb();
+    await db.collection("users").updateOne(
+      { username: req.user.username },
+      { $set: { faucetpayEmail: email } }
+    );
+
+    return res.json({ ok: true, faucetpayEmail: email });
+  } catch (err) {
+    console.error("[donations faucetpay-email]", err.message);
+    return res.status(500).json({ error: "Error interno" });
+  }
+});
+
 module.exports = app;
