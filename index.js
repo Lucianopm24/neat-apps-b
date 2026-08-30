@@ -7466,41 +7466,270 @@ app.get("/agents/me/snake/leaderboard", auth, requireAuth, async (req, res) => {
   return arenaGateway(req, res, "GET", `/snake/leaderboard?limit=${limit}`);
 });
 
-// ══════════ Retiros de donaciones vía FaucetPay (USDT) ══════════
-// Agregar junto a las otras constantes de entorno, cerca de MONGO_URI etc.
-const FAUCETPAY_API_KEY = process.env.FAUCETPAY_API_KEY;
-const FAUCETPAY_MIN_WITHDRAW = 0.0001; // USDT — mínimo real de FaucetPay
+// ══════════════════════════════════════════════════════════════════════════
+// NEAT DONATE — backend completo
+// Pegar dentro de index.js del ecosistema Neat, junto a las demás rutas.
+// Requiere: auth, requireAuth, getDb ya definidos arriba en el archivo.
+// ══════════════════════════════════════════════════════════════════════════
 
-// FaucetPay normaliza TODAS las monedas a 8 decimales (como satoshis de BTC),
-// sin importar los decimales nativos de la moneda en su blockchain.
-// 1 USDT (FaucetPay) = 100_000_000 unidades mínimas.
-const FAUCETPAY_UNIT_MULTIPLIER = 100_000_000;
+const crypto = require("crypto"); // puede que ya esté declarado arriba en tu archivo — si es así, borra esta línea
+
+// ── Config / env vars ───────────────────────────────────────────────────────
+const FAUCETPAY_API_KEY = process.env.FAUCETPAY_API_KEY;
+const FAUCETPAY_MIN_WITHDRAW = 0.0001; // USDT
+const FAUCETPAY_UNIT_MULTIPLIER = 100_000_000; // FaucetPay usa 8 decimales para TODAS las monedas
+
+const ADSLAB_API_KEY = process.env.ADSLAB_API_KEY || "uakBa1giqBJr5JTCs1ETMCVGlbVeRbwruEHTEThd";
+const ADSLAB_SECRET_KEY = process.env.ADSLAB_SECRET_KEY || "JE1NAZIrLcn2tpGndiuBO2k0zNH1UNUY";
+const ADSLAB_RETURN_URL = process.env.ADSLAB_RETURN_URL || "https://opentokens.lucianopm.com/claim-success";
+const NUSDT_PER_CAPTCHA = Number(process.env.NUSDT_PER_CAPTCHA || 0.0001); // ajusta al pago real de AdsLab
 
 function usdtToFaucetPayUnits(amountUsdt) {
-  // Redondeo hacia abajo: nunca enviar de más por error de punto flotante.
   return Math.floor(amountUsdt * FAUCETPAY_UNIT_MULTIPLIER);
 }
 
-// Helper: obtiene el saldo donado disponible para retirar de un usuario.
-// Ajusta el nombre del campo/colección a como ya guardas el saldo donado.
-async function getDonatedBalance(db, username) {
-  const user = await db.collection("users").findOne({ username });
-  return user?.donatedBalance || 0; // en USDT, no en unidades FaucetPay
-}
+// ═══════════════════════ 1. GANAR nUSDT (captchas AdsLab) ═══════════════════
 
-// POST /donations/withdraw
-// Body: { amount: number (USDT) }
-// Requiere que el usuario tenga faucetpayEmail guardado en su perfil.
+// El usuario pide resolver un captcha → iniciamos sesión en AdsLab.
+app.post("/donations/captcha/init", auth, requireAuth, async (req, res) => {
+  try {
+    const username = req.user.username;
+    const r = await fetch("https://adslab.me/api/v1/captcha/init", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": ADSLAB_API_KEY },
+      body: JSON.stringify({ sub_id: username, return_url: ADSLAB_RETURN_URL }),
+    });
+    const j = await r.json().catch(() => null);
+    if (!j || !j.success) {
+      return res.status(502).json({ error: "No se pudo iniciar el captcha", detail: j?.message || null });
+    }
+    return res.json({ ok: true, token: j.token, solve_url: j.solve_url });
+  } catch (err) {
+    console.error("[captcha init]", err.message);
+    return res.status(502).json({ error: "AdsLab no respondió" });
+  }
+});
+
+// Webhook público (lo llama AdsLab, no el usuario) — verifica firma y acredita nUSDT.
+// Configura esta URL en el panel de AdsLab como Captcha Postback URL:
+//   https://neat-apps-b.vercel.app/donations/captcha/webhook
+app.post("/donations/captcha/webhook", async (req, res) => {
+  try {
+    const { sub_id, status, timestamp, signature } = req.body || {};
+    if (!sub_id || !timestamp || !signature) return res.status(400).send("Faltan campos");
+
+    const expected = crypto
+      .createHmac("sha256", ADSLAB_SECRET_KEY)
+      .update(`${sub_id}:${timestamp}`)
+      .digest("hex");
+
+    // Comparación en tiempo constante
+    const sigBuf = Buffer.from(signature, "hex");
+    const expBuf = Buffer.from(expected, "hex");
+    const validSig = sigBuf.length === expBuf.length && crypto.timingSafeEqual(sigBuf, expBuf);
+    if (!validSig) return res.status(403).send("Invalid Signature");
+
+    if (status !== "success") return res.status(200).send("OK"); // ignorar sin acreditar
+
+    const db = await getDb();
+
+    // Idempotencia: no acreditar dos veces el mismo evento (mismo sub_id+timestamp)
+    const dupe = await db.collection("captcha_events").findOne({ sub_id, timestamp });
+    if (dupe) return res.status(200).send("OK");
+
+    await db.collection("captcha_events").insertOne({ sub_id, timestamp, creditedAt: new Date() });
+    await db.collection("users").updateOne(
+      { username: sub_id },
+      { $inc: { nusdtBalance: NUSDT_PER_CAPTCHA } }
+    );
+
+    return res.status(200).send("OK");
+  } catch (err) {
+    console.error("[captcha webhook]", err.message);
+    return res.status(500).send("Error interno");
+  }
+});
+
+// Ver mi saldo de nUSDT (ganado) y saldo donado (retirable en USDT real)
+app.get("/donations/me/balance", auth, requireAuth, async (req, res) => {
+  const db = await getDb();
+  const user = await db.collection("users").findOne(
+    { username: req.user.username },
+    { projection: { nusdtBalance: 1, donatedBalance: 1, faucetpayEmail: 1, donateProfile: 1 } }
+  );
+  res.json({
+    nusdtBalance: user?.nusdtBalance || 0,
+    donatedBalance: user?.donatedBalance || 0,
+    faucetpayEmail: user?.faucetpayEmail || null,
+    hasProfile: !!user?.donateProfile,
+  });
+});
+
+// ═══════════════════════ 2. PERFILES (para poder recibir donaciones) ════════
+
+// Crear o actualizar mi perfil público de receptor
+app.post("/donations/profile", auth, requireAuth, async (req, res) => {
+  try {
+    const { displayName, description } = req.body || {};
+    if (typeof displayName !== "string" || !displayName.trim()) {
+      return res.status(400).json({ error: "displayName requerido" });
+    }
+    const db = await getDb();
+    await db.collection("users").updateOne(
+      { username: req.user.username },
+      {
+        $set: {
+          donateProfile: {
+            displayName: displayName.trim().slice(0, 60),
+            description: String(description || "").trim().slice(0, 280),
+            updatedAt: new Date(),
+          },
+        },
+      }
+    );
+    res.json({ ok: true, profileUrl: `/donate/${req.user.username}` });
+  } catch (err) {
+    console.error("[donations profile]", err.message);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// Buscar perfiles por username o nombre mostrado
+app.get("/donations/profiles/search", async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim();
+    if (!q) return res.json({ profiles: [] });
+
+    const db = await getDb();
+    const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    const users = await db
+      .collection("users")
+      .find(
+        { donateProfile: { $exists: true }, $or: [{ username: re }, { "donateProfile.displayName": re }] },
+        { projection: { username: 1, donateProfile: 1, totalReceived: 1 }, limit: 20 }
+      )
+      .toArray();
+
+    res.json({
+      profiles: users.map((u) => ({
+        username: u.username,
+        displayName: u.donateProfile?.displayName || u.username,
+        description: u.donateProfile?.description || "",
+        totalReceived: u.totalReceived || 0,
+      })),
+    });
+  } catch (err) {
+    console.error("[donations search]", err.message);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// Ver un perfil directo por username (para links directos /donate/<username>)
+app.get("/donations/profiles/:username", async (req, res) => {
+  const db = await getDb();
+  const u = await db.collection("users").findOne(
+    { username: req.params.username },
+    { projection: { username: 1, donateProfile: 1, totalReceived: 1 } }
+  );
+  if (!u || !u.donateProfile) return res.status(404).json({ error: "Perfil no encontrado" });
+  res.json({
+    username: u.username,
+    displayName: u.donateProfile.displayName,
+    description: u.donateProfile.description,
+    totalReceived: u.totalReceived || 0,
+  });
+});
+
+// ═══════════════════════ 3. DONAR nUSDT a otro usuario ══════════════════════
+
+app.post("/donations/send", auth, requireAuth, async (req, res) => {
+  try {
+    const { toUsername, amount } = req.body || {};
+    const from = req.user.username;
+
+    if (typeof toUsername !== "string" || !toUsername.trim()) {
+      return res.status(400).json({ error: "toUsername requerido" });
+    }
+    if (typeof amount !== "number" || !isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: "Monto inválido" });
+    }
+    if (toUsername === from) {
+      return res.status(400).json({ error: "No puedes donarte a ti mismo" });
+    }
+
+    const db = await getDb();
+    const recipient = await db.collection("users").findOne({ username: toUsername });
+    if (!recipient || !recipient.donateProfile) {
+      return res.status(404).json({ error: "Ese usuario no tiene un perfil de donaciones activo" });
+    }
+
+    // Descuento atómico: solo si el saldo de nUSDT alcanza
+    const updatedSender = await db.collection("users").findOneAndUpdate(
+      { username: from, nusdtBalance: { $gte: amount } },
+      { $inc: { nusdtBalance: -amount } },
+      { returnDocument: "after" }
+    );
+    const senderDoc = updatedSender?.value || updatedSender;
+    if (!senderDoc) {
+      return res.status(400).json({ error: "nUSDT insuficiente" });
+    }
+
+    // 1 nUSDT donado = 1 USDT retirable para el receptor
+    await db.collection("users").updateOne(
+      { username: toUsername },
+      { $inc: { donatedBalance: amount, totalReceived: amount } }
+    );
+
+    await db.collection("donations").insertOne({
+      from,
+      to: toUsername,
+      amount,
+      createdAt: new Date(),
+    });
+
+    res.json({ ok: true, newNusdtBalance: senderDoc.nusdtBalance });
+  } catch (err) {
+    console.error("[donations send]", err.message);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+// ═══════════════════════ 4. RETIRAR (FaucetPay) ═════════════════════════════
+
+app.post("/donations/faucetpay-email", auth, requireAuth, async (req, res) => {
+  try {
+    if (!FAUCETPAY_API_KEY) return res.status(500).json({ error: "FaucetPay no configurado" });
+    const { email } = req.body || {};
+    if (typeof email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: "Email inválido" });
+    }
+
+    const checkResp = await fetch("https://faucetpay.io/api/v1/checkaddress", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ api_key: FAUCETPAY_API_KEY, address: email, currency: "USDT" }),
+    });
+    const checkJson = await checkResp.json().catch(() => null);
+    if (!checkJson || checkJson.status !== 200) {
+      return res.status(400).json({ error: "Ese email no pertenece a una cuenta FaucetPay", detail: checkJson?.message || null });
+    }
+
+    const db = await getDb();
+    await db.collection("users").updateOne({ username: req.user.username }, { $set: { faucetpayEmail: email } });
+    res.json({ ok: true, faucetpayEmail: email });
+  } catch (err) {
+    console.error("[faucetpay-email]", err.message);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
 app.post("/donations/withdraw", auth, requireAuth, async (req, res) => {
   try {
-    if (!FAUCETPAY_API_KEY) {
-      return res.status(500).json({ error: "FaucetPay no está configurado en el servidor" });
-    }
+    if (!FAUCETPAY_API_KEY) return res.status(500).json({ error: "FaucetPay no configurado" });
 
     const { amount } = req.body || {};
     const username = req.user.username;
 
-    // ── Validación de input ──────────────────────────────────────────
     if (typeof amount !== "number" || !isFinite(amount) || amount <= 0) {
       return res.status(400).json({ error: "Monto inválido" });
     }
@@ -7511,66 +7740,27 @@ app.post("/donations/withdraw", auth, requireAuth, async (req, res) => {
     const db = await getDb();
     const user = await db.collection("users").findOne({ username });
     if (!user) return res.status(404).json({ error: "Usuario no encontrado" });
-
     if (!user.faucetpayEmail) {
-      return res.status(400).json({
-        error: "Debes registrar tu email de FaucetPay antes de retirar",
-        fix: "POST /donations/faucetpay-email con { email }",
-      });
+      return res.status(400).json({ error: "Registra tu email de FaucetPay primero", fix: "POST /donations/faucetpay-email" });
+    }
+    if (amount > (user.donatedBalance || 0)) {
+      return res.status(400).json({ error: "Saldo donado insuficiente", available: user.donatedBalance || 0 });
     }
 
-    // ── Verificar saldo donado disponible (no el ganado por captchas) ──
-    const available = user.donatedBalance || 0;
-    if (amount > available) {
-      return res.status(400).json({ error: "Saldo donado insuficiente", available });
-    }
-
-    // ── Verificar que el destino sea un usuario válido de FaucetPay ────
-    const checkResp = await fetch("https://faucetpay.io/api/v1/checkaddress", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        api_key: FAUCETPAY_API_KEY,
-        address: user.faucetpayEmail,
-        currency: "USDT",
-      }),
-    });
-    const checkJson = await checkResp.json().catch(() => null);
-    if (!checkJson || checkJson.status !== 200) {
-      return res.status(400).json({
-        error: "El email de FaucetPay no es válido o no está registrado",
-        detail: checkJson?.message || null,
-      });
-    }
-
-    // ── Descontar saldo ANTES de llamar a FaucetPay (evita doble retiro
-    //    si el usuario dispara dos requests casi simultáneas) ──────────
     const decremented = await db.collection("users").findOneAndUpdate(
       { username, donatedBalance: { $gte: amount } },
       { $inc: { donatedBalance: -amount } },
       { returnDocument: "after" }
     );
-    if (!decremented?.value && !decremented) {
-      // saldo cambió entre el check y este punto (carrera de concurrencia)
-      return res.status(409).json({ error: "Saldo insuficiente (concurrencia), reintenta" });
-    }
+    const senderDoc = decremented?.value || decremented;
+    if (!senderDoc) return res.status(409).json({ error: "Saldo insuficiente (concurrencia), reintenta" });
 
-    // ── Registrar la transacción como "pending" antes del envío ────────
-    const withdrawalDoc = {
-      username,
-      amountUsdt: amount,
-      faucetpayEmail: user.faucetpayEmail,
-      status: "pending",
-      createdAt: new Date(),
-    };
-    const { insertedId } = await db.collection("donation_withdrawals").insertOne(withdrawalDoc);
+    const { insertedId } = await db.collection("donation_withdrawals").insertOne({
+      username, amountUsdt: amount, faucetpayEmail: user.faucetpayEmail, status: "pending", createdAt: new Date(),
+    });
 
-    // ── Llamada real a FaucetPay ────────────────────────────────────────
     const units = usdtToFaucetPayUnits(amount);
-    const ip =
-      req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
-      req.socket?.remoteAddress ||
-      "0.0.0.0";
+    const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket?.remoteAddress || "0.0.0.0";
 
     let sendJson;
     try {
@@ -7587,91 +7777,28 @@ app.post("/donations/withdraw", auth, requireAuth, async (req, res) => {
       });
       sendJson = await sendResp.json().catch(() => null);
     } catch (e) {
-      console.error("[faucetpay send] error de red:", e.message);
+      console.error("[faucetpay send]", e.message);
       sendJson = null;
     }
 
-    // ── Si FaucetPay falló, revertir el saldo y marcar como fallido ─────
     if (!sendJson || sendJson.status !== 200) {
-      await db.collection("users").updateOne(
-        { username },
-        { $inc: { donatedBalance: amount } } // devolver el saldo
-      );
+      await db.collection("users").updateOne({ username }, { $inc: { donatedBalance: amount } });
       await db.collection("donation_withdrawals").updateOne(
         { _id: insertedId },
         { $set: { status: "failed", error: sendJson?.message || "Sin respuesta de FaucetPay", failedAt: new Date() } }
       );
-      return res.status(502).json({
-        error: "El retiro falló, tu saldo fue devuelto",
-        detail: sendJson?.message || null,
-      });
+      return res.status(502).json({ error: "El retiro falló, tu saldo fue devuelto", detail: sendJson?.message || null });
     }
 
-    // ── Éxito: guardar payout_id para auditoría ─────────────────────────
     await db.collection("donation_withdrawals").updateOne(
       { _id: insertedId },
-      {
-        $set: {
-          status: "completed",
-          payoutId: sendJson.payout_id,
-          payoutUserHash: sendJson.payout_user_hash,
-          completedAt: new Date(),
-        },
-      }
+      { $set: { status: "completed", payoutId: sendJson.payout_id, payoutUserHash: sendJson.payout_user_hash, completedAt: new Date() } }
     );
 
-    return res.json({
-      ok: true,
-      amountUsdt: amount,
-      payoutId: sendJson.payout_id,
-      newBalance: (decremented.value || decremented).donatedBalance,
-    });
+    res.json({ ok: true, amountUsdt: amount, payoutId: sendJson.payout_id, newBalance: senderDoc.donatedBalance });
   } catch (err) {
     console.error("[donations withdraw]", err.message);
-    return res.status(500).json({ error: "Error interno al procesar el retiro" });
-  }
-});
-
-// POST /donations/faucetpay-email
-// Body: { email: string }
-// Guarda/actualiza el email de FaucetPay del usuario (previa verificación).
-app.post("/donations/faucetpay-email", auth, requireAuth, async (req, res) => {
-  try {
-    if (!FAUCETPAY_API_KEY) {
-      return res.status(500).json({ error: "FaucetPay no está configurado en el servidor" });
-    }
-    const { email } = req.body || {};
-    if (typeof email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return res.status(400).json({ error: "Email inválido" });
-    }
-
-    const checkResp = await fetch("https://faucetpay.io/api/v1/checkaddress", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        api_key: FAUCETPAY_API_KEY,
-        address: email,
-        currency: "USDT",
-      }),
-    });
-    const checkJson = await checkResp.json().catch(() => null);
-    if (!checkJson || checkJson.status !== 200) {
-      return res.status(400).json({
-        error: "Ese email no pertenece a una cuenta de FaucetPay registrada",
-        detail: checkJson?.message || null,
-      });
-    }
-
-    const db = await getDb();
-    await db.collection("users").updateOne(
-      { username: req.user.username },
-      { $set: { faucetpayEmail: email } }
-    );
-
-    return res.json({ ok: true, faucetpayEmail: email });
-  } catch (err) {
-    console.error("[donations faucetpay-email]", err.message);
-    return res.status(500).json({ error: "Error interno" });
+    res.status(500).json({ error: "Error interno al procesar el retiro" });
   }
 });
 
