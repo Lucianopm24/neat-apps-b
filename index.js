@@ -7471,6 +7471,8 @@ app.get("/agents/me/snake/leaderboard", auth, requireAuth, async (req, res) => {
 // Requiere: auth, requireAuth, getDb ya definidos arriba en el archivo.
 // ══════════════════════════════════════════════════════════════════════════
 
+const crypto = require("crypto"); // puede que ya esté declarado arriba en tu archivo — si es así, borra esta línea
+
 // ── Config / env vars ───────────────────────────────────────────────────────
 const FAUCETPAY_API_KEY = process.env.FAUCETPAY_API_KEY;
 const FAUCETPAY_MIN_WITHDRAW = 0.0001; // USDT
@@ -7528,9 +7530,55 @@ app.post("/donations/captcha/init", auth, requireAuth, async (req, res) => {
   }
 });
 
+// Donar SIN cuenta: alguien con un direct link (neat.blue/donate?to=USUARIO) puede
+// resolver un captcha y que se done directo a esa persona, sin registrarse.
+// Público (sin auth) — cualquiera puede iniciar esto para cualquier perfil activo.
+app.post("/donations/captcha/init-anon", async (req, res) => {
+  try {
+    const { toUsername } = req.body || {};
+    if (typeof toUsername !== "string" || !toUsername.trim()) {
+      return res.status(400).json({ error: "toUsername requerido" });
+    }
+
+    const db = await getDb();
+    const recipient = await db.collection("users").findOne({ username: toUsername });
+    if (!recipient || !recipient.donateProfile) {
+      return res.status(404).json({ error: "Ese usuario no tiene un perfil de donaciones activo" });
+    }
+
+    const claimId = crypto.randomUUID();
+    await db.collection("pending_captcha_claims").insertOne({
+      _id: claimId,
+      toUsername, // en vez de "username": esto es una donación directa, no una ganancia propia
+      direct: true,
+      createdAt: new Date(),
+      expiresAt: new Date(Date.now() + CAPTCHA_CLAIM_TTL_MS),
+    });
+
+    const returnUrl = `${API_PUBLIC_BASE}/donations/claim/${claimId}`;
+    const anonSubId = "anon_" + claimId; // AdsLab exige un sub_id; no representa a ningún usuario nuestro
+
+    const r = await fetch("https://adslab.me/api/v1/captcha/init", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": ADSLAB_API_KEY },
+      body: JSON.stringify({ sub_id: anonSubId, return_url: returnUrl }),
+    });
+    const j = await r.json().catch(() => null);
+    if (!j || !j.success) {
+      await db.collection("pending_captcha_claims").deleteOne({ _id: claimId });
+      return res.status(502).json({ error: "No se pudo iniciar el captcha", detail: j?.message || null });
+    }
+    return res.json({ ok: true, token: j.token, solve_url: j.solve_url });
+  } catch (err) {
+    console.error("[captcha init-anon]", err.message);
+    return res.status(502).json({ error: "AdsLab no respondió" });
+  }
+});
+
 // Link de reclamo — lo visita el NAVEGADOR del usuario (no un webhook server-to-server),
 // pero solo AdsLab lo dispara y solo cuando el captcha fue resuelto con éxito.
 // Público (sin auth): la seguridad viene de que el UUID es secreto, de un solo uso, y expira.
+// Maneja dos casos: ganancia propia (claim.username) o donación directa anónima (claim.toUsername).
 app.get("/donations/claim/:claimId", async (req, res) => {
   const { claimId } = req.params;
   try {
@@ -7549,6 +7597,23 @@ app.get("/donations/claim/:claimId", async (req, res) => {
       return res.redirect(302, `${NEAT_DONATE_URL}?claim=expired`);
     }
 
+    if (claim.direct) {
+      // Donación anónima: va directo a USDT retirable del receptor, sin pasar por nUSDT.
+      await db.collection("users").updateOne(
+        { username: claim.toUsername },
+        { $inc: { donatedBalance: NUSDT_PER_CAPTCHA, totalReceived: NUSDT_PER_CAPTCHA } }
+      );
+      await db.collection("donations").insertOne({
+        from: null, // anónimo
+        to: claim.toUsername,
+        amount: NUSDT_PER_CAPTCHA,
+        source: "anon_captcha",
+        createdAt: new Date(),
+      });
+      return res.redirect(302, `${NEAT_DONATE_URL}?to=${encodeURIComponent(claim.toUsername)}&claim=donated`);
+    }
+
+    // Ganancia propia normal (usuario logueado resolviendo captcha para sí mismo)
     await db.collection("users").updateOne(
       { username: claim.username },
       { $inc: { nusdtBalance: NUSDT_PER_CAPTCHA } }
