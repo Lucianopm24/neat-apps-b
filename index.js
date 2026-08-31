@@ -7471,8 +7471,6 @@ app.get("/agents/me/snake/leaderboard", auth, requireAuth, async (req, res) => {
 // Requiere: auth, requireAuth, getDb ya definidos arriba en el archivo.
 // ══════════════════════════════════════════════════════════════════════════
 
-const crypto = require("crypto"); // puede que ya esté declarado arriba en tu archivo — si es así, borra esta línea
-
 // ── Config / env vars ───────────────────────────────────────────────────────
 const FAUCETPAY_API_KEY = process.env.FAUCETPAY_API_KEY;
 const FAUCETPAY_MIN_WITHDRAW = 0.0001; // USDT
