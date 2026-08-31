@@ -7465,12 +7465,13 @@ app.get("/agents/me/snake/leaderboard", auth, requireAuth, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || "20", 10) || 20, 100);
   return arenaGateway(req, res, "GET", `/snake/leaderboard?limit=${limit}`);
 });
-
 // ══════════════════════════════════════════════════════════════════════════
 // NEAT DONATE — backend completo
 // Pegar dentro de index.js del ecosistema Neat, junto a las demás rutas.
 // Requiere: auth, requireAuth, getDb ya definidos arriba en el archivo.
 // ══════════════════════════════════════════════════════════════════════════
+
+const crypto = require("crypto"); // puede que ya esté declarado arriba en tu archivo — si es así, borra esta línea
 
 // ── Config / env vars ───────────────────────────────────────────────────────
 const FAUCETPAY_API_KEY = process.env.FAUCETPAY_API_KEY;
@@ -7478,27 +7479,48 @@ const FAUCETPAY_MIN_WITHDRAW = 0.0001; // USDT
 const FAUCETPAY_UNIT_MULTIPLIER = 100_000_000; // FaucetPay usa 8 decimales para TODAS las monedas
 
 const ADSLAB_API_KEY = process.env.ADSLAB_API_KEY || "uakBa1giqBJr5JTCs1ETMCVGlbVeRbwruEHTEThd";
-const ADSLAB_SECRET_KEY = process.env.ADSLAB_SECRET_KEY || "JE1NAZIrLcn2tpGndiuBO2k0zNH1UNUY";
-const ADSLAB_RETURN_URL = process.env.ADSLAB_RETURN_URL || "https://opentokens.lucianopm.com/claim-success";
 const NUSDT_PER_CAPTCHA = Number(process.env.NUSDT_PER_CAPTCHA || 0.0001); // ajusta al pago real de AdsLab
+const API_PUBLIC_BASE = process.env.API_PUBLIC_BASE || "https://api.neat.blue"; // dominio que recibe el claim
+const NEAT_DONATE_URL = process.env.NEAT_DONATE_URL || "https://neat.blue/donate";
+const CAPTCHA_CLAIM_TTL_MS = 15 * 60 * 1000; // 15 minutos de validez del UUID
 
 function usdtToFaucetPayUnits(amountUsdt) {
   return Math.floor(amountUsdt * FAUCETPAY_UNIT_MULTIPLIER);
 }
 
 // ═══════════════════════ 1. GANAR nUSDT (captchas AdsLab) ═══════════════════
+//
+// Sin webhook: AdsLab solo redirige el navegador del usuario a return_url
+// CUANDO el captcha se resolvió de verdad. Aprovechamos eso: en vez de
+// mandarlo directo a neat.blue/donate, lo mandamos a un link con un UUID
+// de un solo uso que solo nuestro servidor conoce. Cuando ese link se
+// visita, acreditamos y lo destruimos.
 
-// El usuario pide resolver un captcha → iniciamos sesión en AdsLab.
+// El usuario pide resolver un captcha → generamos el UUID y luego iniciamos en AdsLab.
 app.post("/donations/captcha/init", auth, requireAuth, async (req, res) => {
   try {
     const username = req.user.username;
+    const db = await getDb();
+
+    const claimId = crypto.randomUUID();
+    await db.collection("pending_captcha_claims").insertOne({
+      _id: claimId,
+      username,
+      createdAt: new Date(),
+      expiresAt: new Date(Date.now() + CAPTCHA_CLAIM_TTL_MS),
+    });
+
+    const returnUrl = `${API_PUBLIC_BASE}/donations/claim/${claimId}`;
+
     const r = await fetch("https://adslab.me/api/v1/captcha/init", {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": ADSLAB_API_KEY },
-      body: JSON.stringify({ sub_id: username, return_url: ADSLAB_RETURN_URL }),
+      body: JSON.stringify({ sub_id: username, return_url: returnUrl }),
     });
     const j = await r.json().catch(() => null);
     if (!j || !j.success) {
+      // limpia el claim si AdsLab no pudo iniciar la sesión
+      await db.collection("pending_captcha_claims").deleteOne({ _id: claimId });
       return res.status(502).json({ error: "No se pudo iniciar el captcha", detail: j?.message || null });
     }
     return res.json({ ok: true, token: j.token, solve_url: j.solve_url });
@@ -7508,43 +7530,36 @@ app.post("/donations/captcha/init", auth, requireAuth, async (req, res) => {
   }
 });
 
-// Webhook público (lo llama AdsLab, no el usuario) — verifica firma y acredita nUSDT.
-// Configura esta URL en el panel de AdsLab como Captcha Postback URL:
-//   https://neat-apps-b.vercel.app/donations/captcha/webhook
-app.post("/donations/captcha/webhook", async (req, res) => {
+// Link de reclamo — lo visita el NAVEGADOR del usuario (no un webhook server-to-server),
+// pero solo AdsLab lo dispara y solo cuando el captcha fue resuelto con éxito.
+// Público (sin auth): la seguridad viene de que el UUID es secreto, de un solo uso, y expira.
+app.get("/donations/claim/:claimId", async (req, res) => {
+  const { claimId } = req.params;
   try {
-    const { sub_id, status, timestamp, signature } = req.body || {};
-    if (!sub_id || !timestamp || !signature) return res.status(400).send("Faltan campos");
-
-    const expected = crypto
-      .createHmac("sha256", ADSLAB_SECRET_KEY)
-      .update(`${sub_id}:${timestamp}`)
-      .digest("hex");
-
-    // Comparación en tiempo constante
-    const sigBuf = Buffer.from(signature, "hex");
-    const expBuf = Buffer.from(expected, "hex");
-    const validSig = sigBuf.length === expBuf.length && crypto.timingSafeEqual(sigBuf, expBuf);
-    if (!validSig) return res.status(403).send("Invalid Signature");
-
-    if (status !== "success") return res.status(200).send("OK"); // ignorar sin acreditar
-
     const db = await getDb();
 
-    // Idempotencia: no acreditar dos veces el mismo evento (mismo sub_id+timestamp)
-    const dupe = await db.collection("captcha_events").findOne({ sub_id, timestamp });
-    if (dupe) return res.status(200).send("OK");
+    // Atómico: busca y borra en un solo paso para que no se pueda reclamar dos veces
+    // aunque lleguen dos requests casi simultáneas.
+    const result = await db.collection("pending_captcha_claims").findOneAndDelete({ _id: claimId });
+    const claim = result?.value || result;
 
-    await db.collection("captcha_events").insertOne({ sub_id, timestamp, creditedAt: new Date() });
+    if (!claim) {
+      // ya usado, no existe, o nunca existió
+      return res.redirect(302, `${NEAT_DONATE_URL}?claim=invalid`);
+    }
+    if (claim.expiresAt && new Date(claim.expiresAt) < new Date()) {
+      return res.redirect(302, `${NEAT_DONATE_URL}?claim=expired`);
+    }
+
     await db.collection("users").updateOne(
-      { username: sub_id },
+      { username: claim.username },
       { $inc: { nusdtBalance: NUSDT_PER_CAPTCHA } }
     );
 
-    return res.status(200).send("OK");
+    return res.redirect(302, `${NEAT_DONATE_URL}?claim=success`);
   } catch (err) {
-    console.error("[captcha webhook]", err.message);
-    return res.status(500).send("Error interno");
+    console.error("[captcha claim]", err.message);
+    return res.redirect(302, `${NEAT_DONATE_URL}?claim=error`);
   }
 });
 
